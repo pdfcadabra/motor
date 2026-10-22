@@ -1,0 +1,5 @@
+# Dependencias de Python de la imagen (Dockerfile). Versiones exactas.
+# Pillow: recodificar las imágenes que censura redact.py (JPEG con las tablas DQT y el
+# submuestreo del original, JPEG CMYK y JPEG 2000; la rueda de Linux trae libjpeg y OpenJPEG).
+PyMuPDF==1.28.2
+pillow==12.3.0

@@ -1,0 +1,5 @@
+# Solo para los tests (python -m unittest lossless_images_test.py): generar y decodificar
+# QR y códigos de barras. No va en la imagen de producción. Pillow (que también usan los tests)
+# ya está en requirements.txt. Sin zxing-cpp, esas pruebas se saltan con un aviso.
+-r requirements.txt
+zxing-cpp==3.1.1
