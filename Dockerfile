@@ -33,7 +33,7 @@ ENTRYPOINT ["python3"]
 FROM motor AS tests
 COPY requirements-test.txt ./
 RUN pip install -r requirements-test.txt
-RUN python3 -m unittest redact_test.py redact_leaks_test.py lossless_images_test.py pdf_check_test.py \
+RUN python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py pdf_check_test.py \
     && touch /tmp/tests-ok
 
 # Imagen final: la de "motor", solo si los tests han pasado

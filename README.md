@@ -14,7 +14,7 @@ sellos) al comprimir con un compresor externo. Está escrito en Python sobre
 
 | Script | Comando | Función |
 |---|---|---|
-| `redact.py` | `search` | Busca expresiones regulares en el texto de las páginas (también en los campos de formulario y las anotaciones, que aplana antes) y devuelve cada aparición con su rectángulo. |
+| `redact.py` | `search` | Busca expresiones regulares en el texto de las páginas (también en los campos de formulario y las anotaciones, que aplana antes) y devuelve cada aparición con su rectángulo. Opcionalmente, también datos españoles con validación propia (`detectores.py`: NIG, matrícula, teléfono, correo e IBAN). |
 | `redact.py` | `apply` | Censura de forma irreversible las zonas indicadas: elimina el texto, los píxeles de las imágenes y los trazos que tocan cada zona, y pinta encima un recuadro negro. Después limpia lo que pueda contener los términos censurados fuera de las páginas (metadatos Info y XMP, marcadores, adjuntos, nombres de capas, acciones, texto oculto…) y vuelve a buscarlos en el resultado. Si queda cualquier rastro, no escribe la salida. |
 | `lossless_images.py` | `protect` | Antes de comprimir, sustituye las imágenes que no deben perder calidad (1 bit, paletas de hasta 16 colores, imágenes de 8 bits sin JPEG con hasta 16 colores) por un marcador diminuto. |
 | `jpeg_flate.py` | (restore) | Después de comprimir, vuelve a poner las imágenes originales en lugar de sus marcadores y envuelve en Flate los JPEG cuando así ocupan menos (sin pérdida). |
@@ -49,7 +49,7 @@ Tests:
 
 ```bash
 pip install -r requirements-test.txt
-python3 -m unittest redact_test.py redact_leaks_test.py lossless_images_test.py pdf_check_test.py
+python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py pdf_check_test.py
 ```
 
 Las pruebas que comprimen de verdad necesitan Ghostscript. Las de la clase
@@ -112,7 +112,7 @@ página **sin girar** (antes de aplicar `/Rotate`), con el origen en la esquina 
 izquierda de la zona visible (CropBox recortada a la MediaBox) y la `y` hacia abajo. Es el
 espacio de `Page.search_for` de PyMuPDF.
 
-### `redact.py search ENTRADA PATRONES RESULTADOS`
+### `redact.py search ENTRADA PATRONES RESULTADOS [--detectores LISTA]`
 
 - `ENTRADA`: PDF.
 - `PATRONES` (lee): objeto JSON `{categoría: expresión}`. Cada expresión es una cadena no
@@ -122,6 +122,36 @@ espacio de `Page.search_for` de PyMuPDF.
   ```json
   {"dni": "\\b\\d{8}[A-Z]\\b", "custom_0": "Juan Ejemplo"}
   ```
+
+- `--detectores LISTA` (opcional, desde la versión 1.1.0): nombres separados por comas, sin
+  repetir, de los detectores que buscar además de `PATRONES` (que puede ser `{}`). Sin la
+  opción, o con `LISTA` vacía, no se busca ninguno. La categoría de sus hallazgos es el
+  nombre del detector.
+
+  | Detector | Qué reconoce |
+  |---|---|
+  | `nig` | NIG: 19 cifras en bloques 5 + 2 + 1 + 4 + 7, con o sin espacios o puntos entre bloques. Las cifras 9 a 12 (el año) tienen que estar entre 1990 y el año en curso. |
+  | `matricula` | Matrícula actual: 4 cifras y 3 consonantes (sin vocales, Ñ ni Q), con o sin espacio o guion. Provincial: código de provincia de 1 o 2 letras, 4 cifras y 1 o 2 letras, con o sin espacio o guion. Solo en mayúsculas. |
+  | `telefono` | Teléfono español: 9 cifras que empiezan por 6, 7, 8 o 9, seguidas o en grupos 3-3-3, 3-2-2-2 o 2-3-2-2 separados por espacio, punto o guion, con `+34` o `0034` delante si acaso (también entre paréntesis). No cuenta si sigue un decimal, un grupo de miles o una moneda (`€`, `EUR`, `euros`): es un importe. |
+  | `email` | Correo electrónico. |
+  | `iban` | IBAN de cualquier país del registro IBAN de SWIFT (release 101): código de país, 2 cifras de control y el BBAN (cifras y letras), con o sin espacios o guiones, con la longitud de ese país y el dígito de control correcto (ISO 13616, módulo 97). No puede ir pegado a otra letra o cifra. |
+  | `dni_nie` | DNI: 8 cifras (o `12.345.678`, `12 345 678`) y la letra de control. NIE: `X`, `Y` o `Z`, 7 cifras (o `1.234.567`) y la letra de control. Espacio, punto o guion entre el número y las letras si acaso. Solo con letras en mayúscula. |
+  | `cif` | CIF: letra de entidad (`ABCDEFGHJNPQRSUVW`), 7 cifras y el control: cifra con `A`, `B`, `E` y `H`; letra con `P`, `Q`, `R`, `S`, `N` y `W`; cualquiera de los dos con el resto. Espacio, punto o guion tras la letra y antes del control si acaso, y las cifras también como `12.345.67`. |
+
+  Entre los bloques de un dato se admite un salto de línea (en un correo, junto a la arroba,
+  o tras un punto si la línea siguiente empieza en minúscula o cifra): ese dato da un
+  hallazgo por línea, todos con el mismo `group` y el mismo `text`, sin el salto (un correo, sin espacios; los demás, sin
+  espacio junto a un punto o un guion y con uno en cualquier otro caso). Las cifras que
+  reconoce un detector no las reconoce otro detrás de él en este orden, esté o no pedido:
+  `email`, `iban`, `nig`, `dni_nie`, `cif`, `telefono`, `matricula` (las cifras de un IBAN o
+  de un NIG nunca son un teléfono ni un DNI).
+
+  Propagación: cada valor que encuentra un detector se busca después en todas las páginas
+  del documento sin distinguir mayúsculas (con `Page.search_for`, tal como aparece y en la
+  forma de su `text`), para que desaparezca también donde el detector no lo reconoce (en
+  minúsculas, pegado a otro texto…). Cada una de esas apariciones da un hallazgo más por
+  rectángulo, con la categoría y el `text` del valor, su propio `group` y `"propagated": true`.
+  No repite lo que ya cubre un hallazgo del detector.
 
 - `RESULTADOS` (escribe):
 
@@ -136,7 +166,8 @@ espacio de `Page.search_for` de PyMuPDF.
         "text": "12345678Z",
         "context": "...DNI 12345678Z, con domicilio...",
         "category": "dni",
-        "rect": [72.0, 100.5, 140.2, 114.0]
+        "rect": [72.0, 100.5, 140.2, 114.0],
+        "group": "8c3e5b1a-4d2f-4b6e-9f0a-7d1c2e3b4a5f"
       }
     ],
     "errors": [
@@ -154,12 +185,15 @@ espacio de `Page.search_for` de PyMuPDF.
   | `context` | cadena | Hasta 30 caracteres a cada lado, entre `...` y `...`. |
   | `category` | cadena | Categoría del patrón. |
   | `rect` | 4 números | Rectángulo de la aparición (ver [Coordenadas](#coordenadas)). |
+  | `group` | cadena | Desde la versión 1.1.0. Identificador del dato, único dentro de `RESULTADOS`: los hallazgos de un detector que son partes de un mismo dato partido (uno por línea, o por trozo de línea si hay un hueco grande en medio) comparten `group`; un dato sin partir, y cada hallazgo de `PATRONES`, tienen el suyo. No dice nada fuera de la respuesta en que viene. |
+  | `propagated` | booleano | Desde la versión 1.1.0, opcional: solo aparece, con `true`, en las otras apariciones de un valor que ha encontrado un detector (ver `--detectores`). |
 
   Cada aparición da un hallazgo, sin duplicados (mismo texto en el mismo sitio). Una
   expresión que no compila no detiene la búsqueda: va a `errors` con su categoría.
 
 - Salida: 0; 1; 3; 4 si `PATRONES` no es un objeto JSON o alguno de sus valores no es una
-  cadena no vacía (entonces no escribe `RESULTADOS`).
+  cadena no vacía, o si los argumentos tras `RESULTADOS` no son `--detectores LISTA` con
+  detectores conocidos y sin repetir (entonces no escribe `RESULTADOS`).
 
 ### `redact.py apply ENTRADA SALIDA HALLAZGOS [INFORME]`
 

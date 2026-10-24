@@ -17,6 +17,7 @@ from collections import Counter, namedtuple
 import pymupdf as fitz
 from PIL import Image, ImageChops, ImageStat, JpegImagePlugin
 
+import detectores
 import pdf_check
 
 fitz.TOOLS.mupdf_display_errors(False)
@@ -1707,12 +1708,69 @@ def load_patterns(patterns_path):
     return patterns
 
 
-def search(input_path, patterns_path, results_path):
+def page_chars(page):
+    """[(carácter, bbox, línea)] del texto de la página, con un ("\\n", None, línea) al final
+    de cada línea: unidos dan lo mismo que page.get_text("text"), y las cajas están en el
+    espacio de search_for (página sin girar)."""
+    chars = []
+    line_no = 0
+    for block in page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]:
+        if block["type"] != 0:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                for ch in span["chars"]:
+                    chars.append((ch["c"], ch["bbox"], line_no))  # tupla: un Rect por carácter es lento
+            chars.append(("\n", None, line_no))
+            line_no += 1
+    return chars
+
+
+def match_rects(chars, start, end):
+    """Rectángulos de los caracteres chars[start:end]: uno por línea, y otro más dentro de la
+    misma línea si entre dos caracteres hay un hueco de más de media altura (como
+    search_for, que no une lo que está lejos: dos celdas de una tabla en la misma línea). Los
+    espacios cuentan para la cercanía pero no para el rectángulo."""
+    rects = []
+    current = None   # [(x0, y0, x1, y1) o None, línea, caja del último carácter]
+    for c, box, line in chars[start:end]:
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        if current is not None and current[1] == line:
+            fuzz = (y1 - y0) / 2
+            px0, py0, px1, py1 = current[2]
+            near = px0 - fuzz < x1 and x0 < px1 + fuzz and py0 - fuzz < y1 and y0 < py1 + fuzz
+        else:
+            near = False
+        if not near:
+            current = [None, line, box]
+            rects.append(current)
+        current[2] = box
+        if not c.isspace():
+            r = current[0]
+            current[0] = box if r is None else (min(r[0], x0), min(r[1], y0), max(r[2], x1), max(r[3], y1))
+    return [fitz.Rect(r) for r, _, _ in rects if r is not None and not fitz.Rect(r).is_empty]
+
+
+def parse_detectors(arg):
+    """Nombres de --detectores (separados por comas; vacío, ninguno). BadPatterns si alguno no
+    es un detector de detectores.DETECTORS o está repetido."""
+    names = [n for n in arg.split(",") if n] if arg else []
+    unknown = [n for n in names if n not in detectores.DETECTORS]
+    if unknown:
+        raise BadPatterns("detector desconocido")
+    if len(set(names)) != len(names):
+        raise BadPatterns("detector repetido")
+    return set(names)
+
+
+def search(input_path, patterns_path, results_path, detectors=()):
     patterns = load_patterns(patterns_path)
 
     doc = fitz.open(input_path)
     try:
-        results, errors = _find_all(doc, patterns)
+        results, errors = _find_all(doc, patterns, detectors)
     finally:
         doc.close()
 
@@ -1720,8 +1778,11 @@ def search(input_path, patterns_path, results_path):
         json.dump({"results": results, "errors": errors}, f)
 
 
-def _find_all(doc, patterns):
-    """Hallazgos (results) y errores de patrón (errors) de search en doc, que queda aplanado."""
+def _find_all(doc, patterns, detectors=()):
+    """Hallazgos (results) y errores de patrón (errors) de search en doc, que queda aplanado.
+
+    `detectors`: nombres de detectores.DETECTORS que buscar además de los patrones; su
+    categoría es el nombre del detector."""
     # Se busca sobre el documento aplanado, igual que el que censura apply: así también
     # aparecen los valores de los campos de formulario y el texto de las anotaciones.
     # Sus posiciones coinciden con las del original (el aplanado dibuja la apariencia del
@@ -1746,6 +1807,10 @@ def _find_all(doc, patterns):
                 "message": f"El patrón de búsqueda para '{category}' no es válido: revisa paréntesis o caracteres especiales."
             })
 
+    seen_coordinates = set()
+    det_pages = {}    # página -> {"text", "rects" de los detectores, "counts" por valor plegado}
+    det_values = {}   # valor plegado -> (detector, text): lo que se propaga (_propagated)
+
     for page_num in range(len(doc)):
         page = doc[page_num]
         text = page.get_text("text")
@@ -1760,53 +1825,202 @@ def _find_all(doc, patterns):
         # Se marca tras terminar: si search_for falla, otra categoría lo vuelve a intentar.
         searched = set()
 
+        def add_matches(category, val):
+            """Hallazgos de val en la página (de un patrón): uno por rectángulo, cada uno con
+            su propio group."""
+            if not val or val in searched:
+                return
+
+            # Avanzamos la búsqueda de contexto usando text.find con offset
+            # Esto garantiza un contexto real si el dato aparece múltiples veces.
+            start_search = 0
+
+            areas = page.search_for(val)
+            for area in areas:
+                # Buscar el índice del texto a partir de start_search
+                idx = text.find(val, start_search)
+                context = ""
+
+                if idx != -1:
+                    start = max(0, idx - 30)
+                    end = min(len(text), idx + len(val) + 30)
+                    context = text[start:end].replace('\n', ' ').strip()
+                    start_search = idx + len(val)
+
+                raw_rects.append({
+                    "id": str(uuid.uuid4()),
+                    "page": page_num,
+                    "page_width": p_width,
+                    "page_height": p_height,
+                    "text": val,
+                    "context": f"...{context}...",
+                    "category": category,
+                    "rect": [area.x0, area.y0, area.x1, area.y1],
+                    "group": str(uuid.uuid4())
+                })
+            searched.add(val)
+
         for category, compiled_pattern in compiled_patterns.items():
             try:
                 # Encontrar matches y obtener las posiciones reales en el texto
                 for match in compiled_pattern.finditer(text):
                     val = match.group().strip()
-                    if not val or val in searched:
-                        continue
+                    add_matches(category, val)
+            except Exception:
+                pass
 
-                    # Avanzamos la búsqueda de contexto usando text.find con offset
-                    # Esto garantiza un contexto real si el dato aparece múltiples veces.
-                    start_search = 0
-
-                    areas = page.search_for(val)
-                    for area in areas:
-                        # Buscar el índice del texto a partir de start_search
-                        idx = text.find(val, start_search)
-                        context = ""
-
-                        if idx != -1:
-                            start = max(0, idx - 30)
-                            end = min(len(text), idx + len(val) + 30)
-                            context = text[start:end].replace('\n', ' ').strip()
-                            start_search = idx + len(val)
-
+        # Detectores: cada aparición se sitúa por sus propios caracteres (no con search_for,
+        # que da todas las apariciones de un valor juntas), así que sus rectángulos, uno por
+        # línea si está partida, comparten un group y dos datos iguales no se mezclan.
+        if detectors:
+            try:
+                chars = page_chars(page)
+                dtext = "".join(c for c, _, _ in chars)
+                det_page = det_pages[page_num] = {"text": dtext, "rects": [], "counts": Counter()}
+                for name, start, end in detectores.find(dtext, detectors):
+                    group = str(uuid.uuid4())
+                    shown = detectores.canonical(name, dtext[start:end])
+                    context = dtext[max(0, start - 30):end + 30].replace('\n', ' ').strip()
+                    raw = _fold(dtext[start:end])
+                    det_page["counts"][raw] += 1
+                    for needle in (raw, _fold(shown)):
+                        det_values.setdefault(needle, (name, shown))
+                    for area in match_rects(chars, start, end):
+                        det_page["rects"].append(area)
                         raw_rects.append({
                             "id": str(uuid.uuid4()),
                             "page": page_num,
                             "page_width": p_width,
                             "page_height": p_height,
-                            "text": val,
+                            "text": shown,
                             "context": f"...{context}...",
-                            "category": category,
-                            "rect": [area.x0, area.y0, area.x1, area.y1]
+                            "category": name,
+                            "rect": [area.x0, area.y0, area.x1, area.y1],
+                            "group": group
                         })
-                    searched.add(val)
             except Exception:
                 pass
 
         # 2. Deduplicación estricta usando el área completa y el texto
-        seen_coordinates = set()
         for r in raw_rects:
-            coord_hash = f"{r['page']}_{round(r['rect'][0], 1)}_{round(r['rect'][1], 1)}_{round(r['rect'][2], 1)}_{round(r['rect'][3], 1)}_{r['text']}"
+            coord_hash = _coord_hash(r)
+            if coord_hash not in seen_coordinates:
+                seen_coordinates.add(coord_hash)
+                results.append(r)
+
+    if det_values:
+        for r in _propagated(doc, det_pages, det_values):
+            coord_hash = _coord_hash(r)
             if coord_hash not in seen_coordinates:
                 seen_coordinates.add(coord_hash)
                 results.append(r)
 
     return results, errors
+
+
+def _coord_hash(r):
+    return f"{r['page']}_{round(r['rect'][0], 1)}_{round(r['rect'][1], 1)}_{round(r['rect'][2], 1)}_{round(r['rect'][3], 1)}_{r['text']}"
+
+
+def _fold(text):
+    """Forma de comparar un valor con el texto como lo compara search_for: sin distinguir
+    mayúsculas y con cualquier separación de espacios o saltos de línea como un espacio."""
+    return " ".join(text.lower().split())
+
+
+# search_for por defecto (PyMuPDF): une las palabras partidas con guion al final de línea.
+SEARCH_FLAGS = (fitz.TEXT_DEHYPHENATE | fitz.TEXT_PRESERVE_WHITESPACE
+                | fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_MEDIABOX_CLIP)
+
+
+def _occurrences(text, needles):
+    """{needle: [posiciones]} de todas las apariciones de cada needle en text, en una sola
+    pasada: cada posición se mira solo contra los needles que empiezan igual (sus K primeros
+    caracteres). Un str.find por needle sobre todo el documento costaba ~0,65 ms con 300
+    páginas: con miles de valores distintos, segundos."""
+    found = {}
+    if not needles:
+        return found
+    k = min(6, min(len(n) for n in needles))
+    by_prefix = {}
+    for n in needles:
+        by_prefix.setdefault(n[:k], []).append(n)
+    get = by_prefix.get
+    for i in range(len(text) - k + 1):
+        candidates = get(text[i:i + k])
+        if candidates:
+            for n in candidates:
+                if text.startswith(n, i):
+                    found.setdefault(n, []).append(i)
+    return found
+
+
+def _per_page(texts, needles):
+    """{(página, needle): apariciones} de needles en los textos ya plegados de cada página."""
+    pages = sorted(texts)
+    starts, pos = [], 0
+    for p in pages:
+        starts.append(pos)
+        pos += len(texts[p]) + 1
+    whole = "\x00".join(texts[p] for p in pages)   # \x00: ninguna aparición cruza de página
+    counts = Counter()
+    for needle, positions in _occurrences(whole, needles).items():
+        for i in positions:
+            counts[(pages[bisect.bisect_right(starts, i) - 1], needle)] += 1
+    return counts
+
+
+def _propagated(doc, det_pages, det_values):
+    """Hallazgos de las otras apariciones de cada valor detectado, en todo el documento.
+
+    En Anonimizar, un dato identificado tiene que desaparecer en todas partes: también donde
+    el detector no lo reconoce (en minúsculas, pegado a una letra...). Por cada valor
+    distinto (su texto tal cual y su forma de `text`, plegados con _fold) se buscan las
+    páginas donde aparece más veces de las que lo encontró el detector, y solo en esas se usa
+    search_for(valor), como con los patrones: sin distinguir mayúsculas y con lo que el
+    detector ya tapaba fuera (rectángulos dentro de los suyos). Cada rectángulo es un hallazgo
+    con su propio group y `propagated: true`; la categoría y el text son los del valor."""
+    folded = {p: _fold(d["text"]) for p, d in det_pages.items()}
+    dehyphenated = {p: _fold(re.sub(r"-[ \t]*\n[ \t]*", "", d["text"])) for p, d in det_pages.items()}
+    needles = [n for n in det_values if n]
+    counts = _per_page(folded, needles)
+    counts_dehyphenated = _per_page(dehyphenated, needles)
+
+    todo = {}
+    for (p, needle), n in counts.items():
+        if n > det_pages[p]["counts"][needle]:
+            todo.setdefault(p, set()).add(needle)
+    for (p, needle), n in counts_dehyphenated.items():
+        if n > counts[(p, needle)]:   # partida con guion al final de línea: solo la ve search_for
+            todo.setdefault(p, set()).add(needle)
+
+    out = []
+    for p in sorted(todo):
+        page = doc[p]
+        textpage = page.get_textpage(flags=SEARCH_FLAGS)
+        taken = [fitz.Rect(r) + (-0.5, -0.5, 0.5, 0.5) for r in det_pages[p]["rects"]]
+        text = det_pages[p]["text"]
+        for needle in sorted(todo[p]):
+            name, shown = det_values[needle]
+            contexts = [text[max(0, m.start() - 30):m.end() + 30].replace('\n', ' ').strip()
+                        for m in re.finditer(r"\s+".join(map(re.escape, needle.split(" "))), text, re.IGNORECASE)]
+            for i, area in enumerate(page.search_for(needle, textpage=textpage)):
+                if any(t.contains(area) for t in taken):
+                    continue
+                taken.append(area + (-0.5, -0.5, 0.5, 0.5))
+                out.append({
+                    "id": str(uuid.uuid4()),
+                    "page": p,
+                    "page_width": page.rect.width,
+                    "page_height": page.rect.height,
+                    "text": shown,
+                    "context": f"...{contexts[min(i, len(contexts) - 1)] if contexts else ''}...",
+                    "category": name,
+                    "rect": [area.x0, area.y0, area.x1, area.y1],
+                    "group": str(uuid.uuid4()),
+                    "propagated": True
+                })
+    return out
 
 
 def item_zone(doc, item):
@@ -2007,7 +2221,12 @@ def main(argv):
         sys.exit(pdf_check.EXIT_ENCRYPTED)
     if action == "search":
         try:
-            search(input_path, argv[3], argv[4])
+            detectors = set()
+            if len(argv) > 5:
+                if argv[5] != "--detectores" or len(argv) != 7:
+                    raise BadPatterns("argumentos de search no válidos")
+                detectors = parse_detectors(argv[6])
+            search(input_path, argv[3], argv[4], detectors)
         except BadPatterns as e:
             print(f"Patrones no válidos en redact.py: {e}", file=sys.stderr)
             sys.exit(EXIT_BAD_PATTERNS)
