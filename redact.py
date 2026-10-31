@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Blanca Molina Rojas (PDFcadabra)
 import bisect
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -15,7 +16,7 @@ import zlib
 from collections import Counter, namedtuple
 
 import pymupdf as fitz
-from PIL import Image, ImageChops, ImageStat, JpegImagePlugin
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat, JpegImagePlugin
 
 import detectores
 import pdf_check
@@ -664,6 +665,16 @@ def _pil(pix):
     return Image.frombytes(_PIL_MODES[pix.n], (pix.width, pix.height), pix.samples)
 
 
+def _few_colors(img):
+    """¿Tiene img (Pillow) MAX_LOSSLESS_COLORS colores distintos o menos?
+
+    getcolors(N) devuelve None en cuanto pasa de N y no sigue contando. Antes,
+    Pixmap.color_count() contaba todos: 2,2-2,5 s por foto de página entera a 300 ppp, el 84 %
+    de apply con un fondo fotográfico (docs/estudio-anonimizar-tamano.md). Misma decisión.
+    """
+    return img.getcolors(MAX_LOSSLESS_COLORS) is not None
+
+
 def _jpeg_like(img, src):
     """img en JPEG con las tablas de cuantización y el submuestreo de src (abierto con Pillow).
 
@@ -708,10 +719,10 @@ def _same_colors(doc, xref, expected):
     return max(diff) <= CMYK_MAX_MEAN_DIFF and max(bias) <= CMYK_MAX_BIAS
 
 
-def _encode_dct(doc, xref, original_xref, pix):
-    """Copia de una JPEG -> JPEG con la calidad del original (ver el comentario de la sección)."""
+def _encode_dct(doc, xref, original_xref, pix, img):
+    """Copia de una JPEG -> JPEG con la calidad del original (ver el comentario de la sección).
+    img: la misma copia en Pillow."""
     original = _original_jpeg(doc, original_xref)
-    img = _pil(pix)
     src = None
     if original is not None:
         try:
@@ -757,10 +768,10 @@ def _same_layout(img, src):
     return img.mode == "L" or JpegImagePlugin.get_sampling(src) >= 0
 
 
-def _encode_jpx(doc, xref, original_xref, pix):
-    """Copia de un JPEG 2000: sin pérdida si el original lo era (o en duda); si no, 9/7."""
+def _encode_jpx(doc, xref, original_xref, pix, img):
+    """Copia de un JPEG 2000: sin pérdida si el original lo era (o en duda); si no, 9/7.
+    img: la misma copia en Pillow."""
     original = _original_jpx(doc, original_xref)
-    img = _pil(pix)
     raw = doc.xref_stream(xref)
     reversible = original is None or jpx_reversible(original) is not False
     if reversible:
@@ -801,13 +812,14 @@ def _encode_jpeg(doc, xref, original_xref, original_filter):
     pix = fitz.Pixmap(doc, xref)
     if pix.alpha or pix.n not in _PIL_MODES:
         return False  # otros espacios de color: se queda sin pérdida (Flate)
-    if pix.color_count() <= MAX_LOSSLESS_COLORS:
+    img = _pil(pix)
+    if _few_colors(img):
         # Código de barras, QR o sello (o una Indexed que MuPDF ha pasado a RGB): sin pérdida,
         # aunque se haya emparejado con un JPEG (como en Comprimir, lossless_images.py).
         return False
     if "JPX" in original_filter:
-        return _encode_jpx(doc, xref, original_xref, pix)
-    return _encode_dct(doc, xref, original_xref, pix)
+        return _encode_jpx(doc, xref, original_xref, pix, img)
+    return _encode_dct(doc, xref, original_xref, pix, img)
 
 
 def recompress_redacted_images(doc, page, before):
@@ -815,7 +827,12 @@ def recompress_redacted_images(doc, page, before):
 
     `before`: _image_slots(page) antes de censurar. Devuelve cuántas se recomprimieron.
     """
-    done = 0
+    return recompress_pairs(doc, redacted_pairs(page, before))
+
+
+def redacted_pairs(page, before):
+    """[(copia, original)] de las imágenes que apply_redactions acaba de sustituir en `page`,
+    como entradas de _image_slots. `before`: _image_slots(page) antes de censurar."""
     after = _image_slots(page)
     after_xrefs = {b[0] for b in after}
     before_xrefs = {b[0] for b in before}
@@ -835,21 +852,1131 @@ def recompress_redacted_images(doc, page, before):
                 replaced.remove(match)
                 copies.remove(copy)
                 pairs.append((copy, match))
-    for (xref, width, height, bits, _, _), match in pairs:
-        original_xref, original_filter = match[0], match[4]
-        bpc = doc.xref_get_key(xref, "BitsPerComponent")[1]
-        try:
-            if bpc == "1":
-                ok = _encode_g4(doc, xref, width, height)
-            elif bpc == "8" and ("DCT" in original_filter or "JPX" in original_filter):
-                ok = _encode_jpeg(doc, xref, original_xref, original_filter)
+    return pairs
+
+
+def recompress_pairs(doc, pairs):
+    """Recomprime cada copia como su original ([(copia, original)] de redacted_pairs).
+    Devuelve cuántas se recomprimieron."""
+    return sum(recompress_copy(doc, copy[0], copy[1], copy[2], match[0], match[4])
+               for copy, match in pairs)
+
+
+def recompress_copy(doc, xref, width, height, original_xref, original_filter):
+    """Recomprime la copia sin comprimir xref como su original. False: queda sin pérdida."""
+    bpc = doc.xref_get_key(xref, "BitsPerComponent")[1]
+    try:
+        if bpc == "1":
+            return _encode_g4(doc, xref, width, height)
+        if bpc == "8" and ("DCT" in original_filter or "JPX" in original_filter):
+            return _encode_jpeg(doc, xref, original_xref, original_filter)
+    except Exception as e:  # nunca tumba la censura: la imagen queda sin pérdida
+        print(f"Aviso en redact.py: no se pudo recomprimir una imagen: {e}", file=sys.stderr)
+    return False
+
+
+# ==========================================
+# 4b. PÍXELES CENSURADOS OCULTOS EN OTRAS PÁGINAS (imágenes compartidas)
+# ==========================================
+# Incidencia (2026-10-27, caso «fondo con recortes» del estudio): apply_redactions borra los
+# píxeles de una zona solo en la copia de la imagen que deja en la página censurada; las demás
+# páginas que comparten la imagen siguen usando la original, entera. Si en alguna de ellas esa
+# parte no se ve (otra CropBox, un recorte, fuera de la página, o la imagen no se dibuja), los
+# píxeles censurados seguían en el archivo sin que el usuario los hubiera visto.
+# Contención (sin cambiar lo que se ve en ninguna página):
+# - Antes de censurar (hidden_pixels_plan), cada dibujo de una imagen que toca una zona se sitúa
+#   con su matriz y sus recortes (trazado de MuPDF), en la página sin girar. En píxeles de la
+#   imagen: los que toca cada zona, redondeados hacia fuera (todo píxel que comparte área con la
+#   zona), y los que se ven en cada página que la usa.
+# - Cada página que usa la imagen y no muestra entera alguna de esas partes recibe su propia
+#   copia con los píxeles que no muestra borrados (HiddenPixels): lo que se ve no cambia. Lo que
+#   se ve de una zona de otra página se queda, como una aparición visible que el usuario no ha
+#   marcado. Las copias las hace MuPDF en una página auxiliar (_Scratch), igual que las de
+#   apply_redactions, y se recomprimen como la original.
+# - En las copias de apply_redactions se borra también cualquier píxel tocado por una zona que
+#   haya quedado con su valor (MuPDF redondea hacia fuera, pero con una tolerancia de 0,001 px).
+# La verificación final lo comprueba píxel a píxel en la salida (hidden_image_pixels,
+# HIDDEN_PIXELS_LEAK). Si una zona toca una imagen que no se puede copiar por página,
+# UNSUPPORTED_REFUSAL.
+
+# Un píxel (columna c, fila f) ocupa [c, c+1] × [f, f+1] en el espacio de la imagen de MuPDF
+# (fila 0 arriba). Cuenta como tocado por una zona, o visible por lo que deja ver la página, si
+# se adentra en él más de PIXEL_EPS px: menos es el error de las matrices de MuPDF (en float32,
+# 19,9999988 en vez de 20), no un píxel tocado. MuPDF, al censurar, usa 0,001 px.
+PIXEL_EPS = 1e-4
+# Segmentos con que se aproxima cada curva de un recorte.
+CURVE_STEPS = 8
+# Lado máximo (pt) de la página auxiliar en que MuPDF hace las copias.
+SCRATCH_MAX_SIDE = 14400
+
+# Un dibujo de imagen en una página: xrefs, las imágenes que pueden ser (una si se ha
+# identificado; vacío para una imagen en línea); matrix, del cuadrado unidad a la página sin
+# girar; clips, los recortes activos [(subtrazados, par_impar)] en espacio de página, o None si
+# alguno no se puede representar como polígono (entonces la imagen se da por no visible).
+Placement = namedtuple("Placement", "xrefs width height matrix clips")
+
+_TRACE_TAG = re.compile(r"\s*<(/?)([a-z_]+)")
+_TRACE_ATTR = re.compile(r'\b([a-z0-9_]+)="([^"]*)"')
+# Recortes por texto o trazo: lo que dibujan dentro se da por no visible. Una máscara de imagen
+# (clip_image_mask) también, salvo la de la propia imagen: MuPDF dibuja una imagen con SMask o
+# /Mask como su máscara con la misma matriz y, dentro, la imagen (ver parse_trace).
+_OPAQUE_CLIPS = ("clip_stroke_path", "clip_text", "clip_stroke_text")
+
+
+def _trace(page):
+    """Llamadas de dibujo de la página (dispositivo de trazado de MuPDF), como texto."""
+    m = fitz.mupdf
+    buf = m.fz_new_buffer(1 << 16)
+    out = m.FzOutput(buf)
+    dev = m.fz_new_trace_device(out)
+    try:
+        m.fz_run_page(page.this, dev, m.FzMatrix(), m.FzCookie())
+        m.fz_close_device(dev)
+    finally:
+        out.fz_close_output()
+    return m.fz_buffer_extract(buf).decode("utf-8", "replace")
+
+
+def _trace_matrix(value):
+    return fitz.Matrix(*(float(v) for v in value.split()))
+
+
+def _path_op(path, tag, attrs):
+    """Añade al recorte en lectura un elemento del trazado (moveto, lineto, curveto...)."""
+    ctm, subpaths = path["ctm"], path["subpaths"]
+
+    def point(x, y):
+        p = fitz.Point(float(attrs[x]), float(attrs[y])) * ctm
+        return (p.x, p.y)
+
+    try:
+        if tag == "moveto":
+            subpaths.append([point("x", "y")])
+        elif tag == "lineto" and subpaths:
+            subpaths[-1].append(point("x", "y"))
+        elif tag == "curveto" and subpaths:
+            p0, p1, p2, p3 = subpaths[-1][-1], point("x1", "y1"), point("x2", "y2"), point("x3", "y3")
+            for i in range(1, CURVE_STEPS + 1):
+                t = i / CURVE_STEPS
+                a, b, c, d = (1 - t) ** 3, 3 * (1 - t) ** 2 * t, 3 * (1 - t) * t ** 2, t ** 3
+                subpaths[-1].append((a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
+                                     a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]))
+        elif tag != "closepath":
+            path["ok"] = False
+    except (KeyError, ValueError):
+        path["ok"] = False
+
+
+def parse_trace(text):
+    """Dibujos de imagen del trazado de una página, en orden: [(es máscara, ancho, alto, matriz,
+    recortes)]. recortes: los activos, [(subtrazados, par_impar)], o None si alguno no se puede
+    representar (texto, trazo, máscara de imagen o suave) o la imagen se dibuja dentro de un
+    patrón o de la definición de una máscara."""
+    draws, stack = [], []
+    opaque = 0   # dentro de un patrón (<tile>) o de la definición de una máscara (<clip_mask>)
+    skip = None  # etiqueta cuyo contenido se salta
+    path = None  # recorte en lectura
+    for line in text.splitlines():
+        m = _TRACE_TAG.match(line)
+        if not m:
+            continue
+        closing, tag = m.group(1) == "/", m.group(2)
+        empty = line.rstrip().endswith("/>")
+        if skip:
+            if closing and tag == skip:
+                skip = None
+            continue
+        if path is not None:
+            if closing and tag == "clip_path":
+                subpaths = [sp for sp in path["subpaths"] if len(sp) >= 3]
+                stack.append((subpaths, path["evenodd"]) if path["ok"] else None)
+                path = None
             else:
-                ok = False
-        except Exception as e:  # nunca tumba la censura: la imagen queda sin pérdida
-            print(f"Aviso en redact.py: no se pudo recomprimir una imagen: {e}", file=sys.stderr)
-            ok = False
-        done += ok
-    return done
+                _path_op(path, tag, dict(_TRACE_ATTR.findall(line)))
+            continue
+        if closing:
+            if tag in ("tile", "clip_mask"):
+                opaque -= 1
+                if tag == "clip_mask":
+                    stack.append(None)  # lo que se dibuja con la máscara, hasta su pop_clip
+            continue
+        if tag == "clip_path":
+            attrs = dict(_TRACE_ATTR.findall(line))
+            if empty:
+                stack.append(([], False))  # recorte vacío: no se ve nada
+            else:
+                path = {"ctm": _trace_matrix(attrs.get("transform", "1 0 0 1 0 0")),
+                        "evenodd": attrs.get("winding") == "eofill", "subpaths": [], "ok": True}
+        elif tag in _OPAQUE_CLIPS:
+            stack.append(None)
+            if not empty:
+                skip = tag
+        elif tag == "clip_image_mask":
+            stack.append(("mask", dict(_TRACE_ATTR.findall(line)).get("transform")))
+        elif tag == "pop_clip":
+            if stack:
+                stack.pop()
+        elif tag in ("tile", "clip_mask"):
+            if not empty:
+                opaque += 1
+            elif tag == "clip_mask":
+                stack.append(None)
+        elif tag in ("fill_image", "fill_image_mask"):
+            attrs = dict(_TRACE_ATTR.findall(line))
+            # La máscara de la propia imagen (misma matriz) es su transparencia, no un recorte de
+            # la página: no cuenta. Cualquier otra máscara de imagen sí, como no visible.
+            own = ("mask", attrs.get("transform"))
+            active = [c for c in stack if c != own]
+            clips = None if opaque or any(c is None or c[0] == "mask" for c in active) else active
+            draws.append((tag == "fill_image_mask", int(attrs["width"]), int(attrs["height"]),
+                          _trace_matrix(attrs["transform"]), clips))
+    return draws
+
+
+_INLINE_IMAGE = re.compile(rb"(?:^|\s)BI\s")
+
+
+def _xobject_refs(doc, holder, key):
+    """{nombre: xref} del diccionario /XObject de holder[key] (key, p. ej. "Resources")."""
+    return _resource_refs(doc, holder, "XObject", key)
+
+
+def _resource_refs(doc, holder, kind, key="Resources"):
+    """{nombre: xref} del diccionario /kind (XObject, Pattern...) de holder[key]."""
+    t, v = doc.xref_get_key(holder, f"{key}/{kind}")
+    if t == "xref":
+        v = doc.xref_object(int(v.split()[0]), compressed=True)
+    elif t != "dict":
+        return {}
+    return {name: int(x) for name, x in re.findall(r"/([^\s/<>\[\]()%]+)\s*(\d+)\s+\d+\s+R", v)}
+
+
+def _is_form(doc, xref):
+    return doc.xref_get_key(xref, "Subtype")[1] == "/Form"
+
+
+def _page_forms(doc, page, patterns=False):
+    """Form XObjects que puede dibujar la página (también anidados) y, con patterns, también sus
+    patrones de mosaico (que se dibujan como un Form)."""
+    def refs(holder):
+        out = list(_xobject_refs(doc, holder, "Resources").values())
+        if patterns:
+            out += [x for x in _resource_refs(doc, holder, "Pattern").values()
+                    if doc.xref_get_key(x, "PatternType")[1] == "1"]
+        return out
+
+    seen, todo = set(), refs(page.xref)
+    while todo:
+        x = todo.pop()
+        if x in seen or not (_is_form(doc, x) or patterns and doc.xref_get_key(x, "PatternType")[1] == "1"):
+            continue
+        seen.add(x)
+        todo.extend(refs(x))
+    return seen
+
+
+def _may_have_inline_images(doc, page):
+    if _INLINE_IMAGE.search(page.read_contents()):
+        return True
+    return any(_INLINE_IMAGE.search(doc.xref_stream(x) or b"") for x in _page_forms(doc, page))
+
+
+_DO = re.compile(rb"/([^\s/\[\]()<>{}%]+)\s*Do\b")
+
+
+def _do_order(doc, page):
+    """xrefs de las imágenes en el orden en que las dibuja el contenido de la página ("/Nombre
+    Do"); None si dibuja algún Form XObject o puede tener imágenes en línea (el orden no se
+    puede saber así)."""
+    data = page.read_contents()
+    if _INLINE_IMAGE.search(data):
+        return None
+    names = _xobject_refs(doc, page.xref, "Resources")
+    order = []
+    for name in _DO.findall(data):
+        x = names.get(name.decode("latin-1"))
+        if x is None or _is_form(doc, x):
+            return None
+        order.append(x)
+    return order
+
+
+def placements(page):
+    """Dibujos de imagen de la página, en orden y sin girar: ([Placement], rectángulo visible de
+    la página).
+
+    Las imágenes se identifican por su ancho, alto y si son máscara entre las de la página
+    (get_images, y las de sus patrones de mosaico: pattern_images). Si hay varias iguales, por el orden de los Do del contenido (_do_order) o, si
+    no se puede, por la huella de sus píxeles, como _image_places (decodifica esas imágenes;
+    dos imágenes con los mismos píxeles quedan sin identificar). Sin get_image_info(xrefs=True):
+    calcula la huella de todas.
+    """
+    doc = page.parent
+    with _unrotated(page):
+        visible = fitz.Rect(page.rect)
+        draws = parse_trace(_trace(page))
+        if not draws:
+            return [], visible
+        candidates = {}
+        for x, kind in page_image_kinds(doc, page):
+            candidates.setdefault(kind, set()).add(x)
+        inline = _may_have_inline_images(doc, page)
+        order = None
+        if any(len(xs) > 1 for xs in candidates.values()) or inline:
+            order = _do_order(doc, page)
+            if order is not None and (len(order) != len(draws) or any(
+                    x not in candidates.get((w, h, mask), ()) for x, (mask, w, h, _, _) in zip(order, draws))):
+                order = None
+        digests = by_digest = None
+        out = []
+        for i, (mask, w, h, matrix, clips) in enumerate(draws):
+            xrefs = candidates.get((w, h, mask), set())
+            if order is not None:
+                xrefs = {order[i]}
+            elif xrefs and (len(xrefs) > 1 or inline):
+                if digests is None:
+                    infos = page.get_textpage(flags=fitz.TEXT_PRESERVE_IMAGES).extractIMGINFO(hashes=True)
+                    digests = [info["digest"] for info in infos] if len(infos) == len(draws) else []
+                    by_digest = {}
+                    for key, xs in candidates.items():
+                        if len(xs) > 1 or inline:
+                            for x in xs:
+                                by_digest.setdefault(fitz.Pixmap(doc, x).digest, set()).add(x)
+                if i < len(digests):
+                    found = by_digest.get(digests[i], set()) & xrefs
+                    if found or inline:
+                        xrefs = found  # vacío: una imagen en línea del mismo tamaño
+            out.append(Placement(frozenset(xrefs), w, h, matrix, clips))
+    return out, visible
+
+
+def _placement_bbox(p):
+    return fitz.Rect(0, 0, 1, 1) * p.matrix
+
+
+def _to_pixels(p):
+    """Función de un punto de la página (sin girar) a píxeles de la imagen; None si la matriz
+    no se puede invertir."""
+    m = p.matrix
+    if abs(m.a * m.d - m.b * m.c) < 1e-12:
+        return None
+    inv, w, h = ~m, p.width, p.height
+    return lambda pt: ((pt[0] * inv.a + pt[1] * inv.c + inv.e) * w,
+                       (pt[0] * inv.b + pt[1] * inv.d + inv.f) * h)
+
+
+def _corners(r):
+    return [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
+
+
+def _area(pts):
+    return sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(pts, pts[1:] + pts[:1])) / 2
+
+
+def _axis_rect(pts):
+    """(x0, y0, x1, y1) si el polígono es un rectángulo alineado con los ejes; si no, None."""
+    if len(pts) == 5 and abs(pts[0][0] - pts[4][0]) < 1e-6 and abs(pts[0][1] - pts[4][1]) < 1e-6:
+        pts = pts[:4]
+    if len(pts) != 4:
+        return None
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        if abs(a[0] - b[0]) > 1e-6 and abs(a[1] - b[1]) > 1e-6:
+            return None
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _touched(x0, y0, x1, y1, box):
+    """Píxeles (rectángulo entero, recortado a box) que comparten área con el rectángulo."""
+    c0, c1 = max(math.floor(x0 + PIXEL_EPS), box[0]), min(math.ceil(x1 - PIXEL_EPS), box[2])
+    r0, r1 = max(math.floor(y0 + PIXEL_EPS), box[1]), min(math.ceil(y1 - PIXEL_EPS), box[3])
+    return (c0, r0, c1, r1) if c0 < c1 and r0 < r1 else None
+
+
+def _new_mask(box, value=0):
+    return Image.new("1", (box[2] - box[0], box[3] - box[1]), value)
+
+
+def _minus(a, b):
+    """Máscara de a sin b (las dos "1", del mismo tamaño)."""
+    return ImageChops.logical_xor(a, ImageChops.logical_and(a, b))
+
+
+def _draw_polygon(mask, box, pts):
+    """Marca en mask (que cubre box, en píxeles de la imagen) los píxeles que toca el polígono.
+    Un rectángulo alineado con los ejes, exacto; cualquier otro, con su relleno y su borde."""
+    r = _axis_rect(pts)
+    if r is not None:
+        t = _touched(*r, box)
+        if t:
+            ImageDraw.Draw(mask).rectangle(
+                (t[0] - box[0], t[1] - box[1], t[2] - 1 - box[0], t[3] - 1 - box[1]), fill=1)
+        return
+    if abs(_area(pts)) < PIXEL_EPS:
+        return
+    # En Pillow el centro del píxel c está en c (aquí, en c + 0,5).
+    ImageDraw.Draw(mask).polygon([(x - box[0] - 0.5, y - box[1] - 0.5) for x, y in pts], fill=1, outline=1)
+
+
+def _zone_box(p, zones):
+    """Píxeles (rectángulo entero) que tocan las zonas en este dibujo; None si ninguno."""
+    f = _to_pixels(p)
+    if f is None:
+        return None
+    full, box = (0, 0, p.width, p.height), None
+    bbox = _placement_bbox(p)
+    for z in zones:
+        if not z.intersects(bbox):
+            continue
+        pts = [f(c) for c in _corners(z)]
+        t = _touched(min(x for x, _ in pts), min(y for _, y in pts),
+                     max(x for x, _ in pts), max(y for _, y in pts), full)
+        if t:
+            box = t if box is None else (min(box[0], t[0]), min(box[1], t[1]),
+                                         max(box[2], t[2]), max(box[3], t[3]))
+    return box
+
+
+def _draw_zones(mask, box, p, zones):
+    """Marca en mask los píxeles que tocan las zonas en este dibujo."""
+    f = _to_pixels(p)
+    if f is None:
+        return
+    bbox = _placement_bbox(p)
+    for z in zones:
+        if z.intersects(bbox):
+            _draw_polygon(mask, box, [f(c) for c in _corners(z)])
+
+
+def _visible_mask(p, visible, box):
+    """Píxeles (en box) de la imagen que se ven en este dibujo: los que comparten área con lo
+    visible de la página y con todos sus recortes. Con recortes de varios subtrazados, par-impar
+    (o con sentidos distintos en no nulo) como una o exclusiva; en no nulo con un solo sentido,
+    como su unión."""
+    f = _to_pixels(p)
+    if f is None or p.clips is None:
+        return _new_mask(box)
+    items = [([_corners(visible)], False)] + p.clips
+    # Lo habitual: la página y los recortes son rectángulos alineados también en píxeles de la
+    # imagen. Entonces basta su intersección.
+    rects = [_axis_rect([f(pt) for pt in sp[0]]) if len(sp) == 1 else None for sp, _ in items]
+    if all(r is not None for r in rects):
+        x0, y0 = max(r[0] for r in rects), max(r[1] for r in rects)
+        x1, y1 = min(r[2] for r in rects), min(r[3] for r in rects)
+        result = _new_mask(box)
+        if x0 < x1 and y0 < y1:
+            _draw_polygon(result, box, [(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        return result
+    result = _new_mask(box, 1)
+    for subpaths, evenodd in items:
+        polys = [[f(pt) for pt in sp] for sp in subpaths]
+        item = _new_mask(box)
+        xor = evenodd or len({_area(q) > 0 for q in polys if abs(_area(q)) >= PIXEL_EPS}) > 1
+        for q in polys:
+            one = _new_mask(box)
+            _draw_polygon(one, box, q)
+            item = ImageChops.logical_xor(item, one) if xor else ImageChops.logical_or(item, one)
+        result = ImageChops.logical_and(result, item)
+        if result.getbbox() is None:
+            break
+    return result
+
+
+def mask_rects(mask, box):
+    """La máscara como rectángulos enteros (en píxeles de la imagen) que no se solapan: segmentos
+    de cada fila, unidos con los iguales de las filas siguientes."""
+    w, h = mask.size
+    data = mask.convert("L").tobytes()
+    rects, open_runs = [], {}
+    for y in range(h + 1):
+        runs = set()
+        if y < h:
+            row = data[y * w:(y + 1) * w]
+            x = row.find(b"\xff")
+            while x >= 0:
+                end = row.find(b"\x00", x)
+                end = w if end < 0 else end
+                runs.add((x, end))
+                x = row.find(b"\xff", end)
+        for run in [r for r in open_runs if r not in runs]:
+            rects.append((run[0] + box[0], open_runs.pop(run) + box[1], run[1] + box[0], y + box[1]))
+        for run in runs:
+            open_runs.setdefault(run, y)
+    return rects
+
+
+def hidden_pixels_plan(doc, zones_by_page):
+    """Antes de censurar: (plan, sin_copia, imágenes por página).
+
+    plan: {xref: entrada} de cada imagen (XObject) que toca una zona, con
+    - size: (ancho, alto); kind: (ancho, alto, es máscara);
+    - box: rectángulo entero de los píxeles que tocan las zonas;
+    - zone_draws: [(página, Placement)] de los dibujos que tocan una zona;
+    - draws: {página: [Placement]} de cada página que usa la imagen (aunque no la dibuje);
+    - visible: {página: rectángulo visible}.
+    sin_copia: True si una zona toca una imagen que no se puede copiar por página (en línea en un
+    Form XObject, o dentro de un patrón, que usa otra página): apply no censura. Imágenes por
+    página: {página: {kind: xrefs}}, para hidden_image_pixels.
+    """
+    images_by_page = {page.number: page.get_images(full=True) for page in doc}
+    tiling = _has_tiling_patterns(doc)
+    pages_using, kinds, in_patterns = {}, {}, {}
+    for page in doc:
+        n = page.number
+        # También las imágenes dibujadas desde patrones de mosaico (p. ej. un fondo CSS en mosaico
+        # que Chrome imprime con un patrón por página y la misma imagen en todos).
+        for x, kind in page_image_kinds(doc, page, images_by_page[n], tiling):
+            pages_using.setdefault(x, set()).add(n)
+            kinds.setdefault(n, {}).setdefault(kind, set()).add(x)
+        if tiling:
+            for x in pattern_images(doc, page):
+                in_patterns.setdefault(x, set()).add(n)
+    traced = {}
+
+    def page_placements(n):
+        if n not in traced:
+            traced[n] = placements(doc[n])
+        return traced[n]
+
+    plan, unsupported, holders = {}, False, {}
+    for n, zones in zones_by_page.items():
+        if not zones or not (images_by_page.get(n) or _may_have_inline_images(doc, doc[n])
+                             or _page_forms(doc, doc[n], patterns=True)):
+            continue
+        for p in page_placements(n)[0]:
+            bbox = _placement_bbox(p)
+            if not any(z.intersects(bbox) for z in zones):
+                continue
+            if not p.xrefs:  # imagen en línea
+                unsupported = unsupported or _inline_in_shared_form(doc, n, holders)
+            for x in p.xrefs:
+                entry = plan.setdefault(x, {"size": (p.width, p.height), "zone_draws": [],
+                                            "kind": (p.width, p.height, doc.xref_get_key(x, "ImageMask")[1] == "true")})
+                entry["zone_draws"].append((n, p))
+    # La contención no puede copiar por página una imagen dibujada desde un patrón: si la usa más
+    # de una página, censurarla podría dejar sus píxeles ocultos en las otras (comprobado con un
+    # fondo CSS en mosaico de Chrome cuya pieza mide tres páginas). Cierra en fallo.
+    for x in plan:
+        if x in in_patterns and len(pages_using[x]) > 1:
+            unsupported = True
+    for x, entry in list(plan.items()):
+        box = None
+        for n, p in entry["zone_draws"]:
+            t = _zone_box(p, zones_by_page[n])
+            if t:
+                box = t if box is None else (min(box[0], t[0]), min(box[1], t[1]),
+                                             max(box[2], t[2]), max(box[3], t[3]))
+        if box is None:
+            del plan[x]
+            continue
+        entry["box"] = box
+        entry["draws"], entry["visible"] = {}, {}
+        for n in sorted(pages_using.get(x, ())):
+            ps, visible = page_placements(n)
+            entry["draws"][n] = [p for p in ps if p.xrefs == {x}]
+            entry["visible"][n] = visible
+    return plan, unsupported, kinds
+
+
+def _is_tiling(doc, xref):
+    try:
+        return doc.xref_get_key(xref, "PatternType")[1] == "1"
+    except Exception:  # un hueco en la tabla xref (PDF salidos de Unir): no es nada
+        return False
+
+
+def pattern_images(doc, page):
+    """Imágenes (XObject) que la página dibuja desde patrones de mosaico, también desde los Form
+    que usan: get_images no las da, y la contención no puede copiarlas por página (retarget_image
+    solo sigue /XObject)."""
+    holders = [page.xref] + sorted(_page_forms(doc, page))
+    todo = [x for h in holders for x in _resource_refs(doc, h, "Pattern").values() if _is_tiling(doc, x)]
+    seen, images = set(), set()
+    while todo:
+        x = todo.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        for r in _xobject_refs(doc, x, "Resources").values():
+            subtype = doc.xref_get_key(r, "Subtype")[1]
+            if subtype == "/Image":
+                images.add(r)
+            elif subtype == "/Form":
+                todo.append(r)
+        todo.extend(r for r in _resource_refs(doc, x, "Pattern").values() if _is_tiling(doc, r))
+    return images
+
+
+def page_image_kinds(doc, page, images=None, tiling=True):
+    """[(xref, (ancho, alto, es máscara))] de las imágenes que usa la página: las de get_images
+    (images, si ya se tienen) y, con tiling, las de sus patrones de mosaico."""
+    out = {}
+    for im in images if images is not None else page.get_images(full=True):
+        out[im[0]] = (im[2], im[3], doc.xref_get_key(im[0], "ImageMask")[1] == "true")
+    if tiling:
+        for x in pattern_images(doc, page):
+            if x not in out:
+                out[x] = (int(doc.xref_get_key(x, "Width")[1] or 0), int(doc.xref_get_key(x, "Height")[1] or 0),
+                          doc.xref_get_key(x, "ImageMask")[1] == "true")
+    return list(out.items())
+
+
+def _has_tiling_patterns(doc):
+    return any(_is_tiling(doc, x) for x in range(1, doc.xref_length()))
+
+
+def _inline_in_shared_form(doc, number, holders_by_page):
+    """¿Dibuja la página un Form XObject (o patrón) con imágenes en línea que usa también otra
+    página? holders_by_page: caché {página: Form y patrones} que se va llenando."""
+    if not holders_by_page:
+        holders_by_page.update({page.number: _page_forms(doc, page, patterns=True) for page in doc})
+    holders = holders_by_page[number]
+    if not holders:
+        return False
+    others = set().union(*(h for n, h in holders_by_page.items() if n != number))
+    return any(_INLINE_IMAGE.search(doc.xref_stream(x) or b"") for x in holders & others)
+
+
+def zone_mask(entry, zones_by_page):
+    """Píxeles de la imagen que tocan las zonas (en todas las páginas), en entry["box"]."""
+    box = entry["box"]
+    mask = _new_mask(box)
+    for n, p in entry["zone_draws"]:
+        _draw_zones(mask, box, p, zones_by_page[n])
+    return mask
+
+
+def erase_mask(entry, number, zones, zone_pixels):
+    """Píxeles que hay que borrar en la imagen que usa la página `number`: los de las zonas
+    (zone_pixels, de zone_mask) que la página no muestra. Los que tocan una zona de la propia
+    página no cuentan como mostrados (están bajo el negro). None si no hay ninguno."""
+    box = entry["box"]
+    shown = _new_mask(box)
+    for p in entry["draws"].get(number, ()):
+        vis = _visible_mask(p, entry["visible"][number], box)
+        if zones and vis.getbbox() is not None:
+            covered = _new_mask(box)
+            _draw_zones(covered, box, p, zones)
+            vis = _minus(vis, covered)
+        shown = ImageChops.logical_or(shown, vis)
+    erase = _minus(zone_pixels, shown)
+    return erase if erase.getbbox() is not None else None
+
+
+def _same_mask(a, b):
+    return ImageChops.logical_xor(a, b).getbbox() is None
+
+
+def contention_copies(plan, zones_by_page):
+    """Copias que hará la contención (además de las de apply_redactions), para el aviso previo:
+    {xref: número}. Una por cada borrado distinto en las páginas en que apply_redactions no hace
+    copia y se ve parte de las zonas; y una con todas las zonas borradas para las que no ven
+    ninguna, salvo que la deje alguna página censurada."""
+    out = {}
+    for x, entry in plan.items():
+        zp = zone_mask(entry, zones_by_page)
+        partial, full_needed, full_done = [], False, False
+        for n in entry["draws"]:
+            zones = zones_by_page.get(n, [])
+            draws = entry["draws"][n]
+            erase = erase_mask(entry, n, zones, zp)
+            redacted = any(z.intersects(_placement_bbox(p)) for p in draws for z in zones)
+            if redacted:
+                full_done = full_done or (erase is not None and _same_mask(erase, zp))
+            elif erase is not None:
+                if not draws or _same_mask(erase, zp):
+                    full_needed = True
+                elif not any(_same_mask(erase, e) for e in partial):
+                    partial.append(erase)
+        count = len(partial) + (full_needed and not full_done)
+        if count:
+            out[x] = count
+    return out
+
+
+def _free(doc, xref):
+    """Vacía una copia que ya no usa nadie (save(garbage=4) la quitaría, pero ocupa memoria)."""
+    smask = doc.xref_get_key(xref, "SMask")
+    doc.update_object(xref, "null")
+    if smask[0] == "xref":
+        doc.update_object(int(smask[1].split()[0]), "null")
+
+
+def _own_dict(doc, holder, key):
+    """Pone en holder[key] una copia propia del diccionario que tenía (directo o por
+    referencia) y devuelve su xref; None si no había."""
+    t, v = doc.xref_get_key(holder, key)
+    if t == "xref":
+        v = doc.xref_object(int(v.split()[0]), compressed=True)
+    elif t != "dict":
+        return None
+    new = doc.get_new_xref()
+    doc.update_object(new, v)
+    doc.xref_set_key(holder, key, f"{new} 0 R")
+    return new
+
+
+def _reaches(doc, form, target):
+    """¿Dibuja el Form XObject (o los que dibuja) la imagen target?"""
+    seen, todo = set(), [form]
+    while todo:
+        x = todo.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        for ref in _xobject_refs(doc, x, "Resources").values():
+            if ref == target:
+                return True
+            if _is_form(doc, ref):
+                todo.append(ref)
+    return False
+
+
+def retarget_image(doc, page, old, new):
+    """La página usa la imagen new donde usaba old, también dentro de sus Form XObjects, sin
+    cambiar las demás páginas: se copian los diccionarios de recursos y los Form del camino.
+    Devuelve cuántas referencias ha cambiado (0 si old no estaba en sus recursos: p. ej., solo
+    en un patrón; entonces queda, y lo detecta la verificación final)."""
+    holder = page.xref
+    if doc.xref_get_key(holder, "Resources")[0] == "null":  # heredados de /Pages
+        parent = doc.xref_get_key(holder, "Parent")
+        while parent[0] == "xref":
+            p = int(parent[1].split()[0])
+            if doc.xref_get_key(p, "Resources")[0] != "null":
+                doc.xref_set_key(holder, "Resources", doc.xref_get_key(p, "Resources")[1])
+                break
+            parent = doc.xref_get_key(p, "Parent")
+    todo, changed = [(holder, 0)], 0
+    while todo:
+        holder, depth = todo.pop()
+        res = _own_dict(doc, holder, "Resources")
+        xobjects = _own_dict(doc, res, "XObject") if res else None
+        if xobjects is None:
+            continue
+        for name in doc.xref_get_keys(xobjects):
+            t, v = doc.xref_get_key(xobjects, name)
+            if t != "xref":
+                continue
+            ref = int(v.split()[0])
+            if ref == old:
+                doc.xref_set_key(xobjects, name, f"{new} 0 R")
+                changed += 1
+            elif depth < MAX_FORM_DEPTH and _is_form(doc, ref) and _reaches(doc, ref, old):
+                clone = doc.get_new_xref()
+                doc.update_object(clone, "<<>>")
+                doc.xref_copy(ref, clone)
+                doc.xref_set_key(xobjects, name, f"{clone} 0 R")
+                todo.append((clone, depth + 1))
+    return changed
+
+
+# Form XObjects anidados que sigue retarget_image (más es un archivo hecho para esto: lo que
+# quede lo detecta la verificación final).
+MAX_FORM_DEPTH = 64
+
+
+class _Scratch:
+    """Página auxiliar, al final del documento, en la que MuPDF hace copias de una imagen con
+    píxeles borrados (las mismas que apply_redactions: sin comprimir, con su SMask). Se quita
+    con close()."""
+
+    def __init__(self, doc):
+        # Se crea ya: añadir una página deja inválidos los objetos Page que haya abiertos.
+        self.doc, self.page = doc, doc.new_page()
+
+    def copy(self, xref, width, height, rects):
+        """xref de una copia nueva de la imagen con esos píxeles (rectángulos enteros) borrados;
+        None si MuPDF no la hace."""
+        doc = self.doc
+        s = min(1.0, SCRATCH_MAX_SIDE / max(width, height))
+        page = self.page
+        page.set_mediabox(fitz.Rect(0, 0, width * s, height * s))
+        res, contents = doc.get_new_xref(), doc.get_new_xref()
+        doc.update_object(res, f"<</XObject<</I {xref} 0 R>>>>")
+        doc.update_object(contents, "<<>>")
+        doc.update_stream(contents, f"q {width * s:.6f} 0 0 {height * s:.6f} 0 0 cm /I Do Q".encode())
+        doc.xref_set_key(page.xref, "Resources", f"{res} 0 R")
+        doc.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+        for r in rects:
+            page.add_redact_annot(fitz.Rect(r) * s, fill=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS,
+                              graphics=fitz.PDF_REDACT_LINE_ART_NONE, text=fitz.PDF_REDACT_TEXT_NONE)
+        new = [im[0] for im in page.get_images(full=True) if im[0] != xref]
+        return new[0] if len(new) == 1 else None
+
+    def close(self):
+        """Quita la página auxiliar (deja inválidos los objetos Page abiertos)."""
+        if self.page is not None:
+            self.doc.delete_page(self.doc.page_count - 1)
+            self.page = None
+
+
+def _pix_bands(pix):
+    """(imagen Pillow de los colores, alfa o None, valor de un píxel borrado) de un Pixmap; None
+    si sus colores no son gris, RGB o CMYK. Una máscara (ImageMask) es solo alfa: borrado = 0
+    (no pinta). CMYK borrado = sin tinta."""
+    size = (pix.width, pix.height)
+    colorants = pix.n - pix.alpha
+    if colorants == 0:
+        return Image.frombytes("L", size, pix.samples), None, 0
+    name = pix.colorspace.name if pix.colorspace else ""
+    mode = {1: "L", 3: "RGB", 4: "CMYK"}.get(colorants)
+    if mode is None or any(s in name for s in ("Separation", "DeviceN", "Lab", "Indexed")):
+        return None
+    alpha = None
+    if pix.alpha:
+        alpha = Image.frombytes("L", size, fitz.Pixmap(None, pix).samples)
+        pix = fitz.Pixmap(pix, 0)
+    return Image.frombytes(mode, size, pix.samples), alpha, _ERASED[mode]
+
+
+# Valor de un píxel borrado por MuPDF, por modo de Pillow: blanco, o sin tinta en CMYK.
+_ERASED = {"L": 255, "RGB": (255, 255, 255), "CMYK": (0, 0, 0, 0)}
+
+
+def _max_band(img):
+    bands = img.split()
+    out = bands[0]
+    for b in bands[1:]:
+        out = ImageChops.lighter(out, b)
+    return out
+
+
+def _differs(img, value):
+    """Máscara ("1") de los píxeles de img distintos de value."""
+    const = Image.new(img.mode, img.size, value)
+    return _max_band(ImageChops.difference(img, const)).point(lambda v: 255 if v else 0).convert("1")
+
+
+def _all_equal(img, mask, value):
+    """¿Valen value todos los píxeles de img bajo mask? (En una pasada: los extremos de cada
+    canal bajo la máscara.)"""
+    values = value if isinstance(value, tuple) else (value,)
+    return all(lo == hi == v for (lo, hi), v in zip(ImageStat.Stat(img, mask=mask).extrema, values))
+
+
+def _tight(box, mask):
+    """(box, máscara) recortados a lo que marca la máscara; None si no marca nada."""
+    b = mask.getbbox()
+    if b is None:
+        return None
+    return (box[0] + b[0], box[1] + b[1], box[0] + b[2], box[1] + b[3]), mask.crop(b)
+
+
+def _scaled_box(box, size, to_size):
+    """box (de una imagen de tamaño size) en otra de tamaño to_size, redondeado hacia fuera."""
+    sx, sy = to_size[0] / size[0], to_size[1] / size[1]
+    return (max(0, math.floor(box[0] * sx)), max(0, math.floor(box[1] * sy)),
+            min(to_size[0], math.ceil(box[2] * sx)), min(to_size[1], math.ceil(box[3] * sy)))
+
+
+def _scaled_mask(mask, box, size, to_size):
+    """(box, máscara) en otra resolución, contando cada píxel que toque uno de la máscara."""
+    if size == to_size:
+        return box, mask
+    to_box = _scaled_box(box, size, to_size)
+    out = _new_mask(to_box)
+    for r in mask_rects(mask, box):
+        t = _scaled_box(r, size, to_size)
+        ImageDraw.Draw(out).rectangle((t[0] - to_box[0], t[1] - to_box[1],
+                                       t[2] - 1 - to_box[0], t[3] - 1 - to_box[1]), fill=1)
+    return to_box, out
+
+
+def _smask_xref(doc, xref):
+    t, v = doc.xref_get_key(xref, "SMask")
+    return int(v.split()[0]) if t == "xref" else None
+
+
+def erased_in(doc, xref, box, mask):
+    """¿Están borrados en la imagen xref (y en su SMask, opaca) todos los píxeles de mask? False
+    si no se puede saber (otro espacio de color)."""
+    tight = _tight(box, mask)
+    if tight is None:
+        return True
+    box, mask = tight
+    try:
+        bands = _pix_bands(fitz.Pixmap(doc, xref))
+        if bands is None:
+            return False
+        img, _, value = bands
+        if not _all_equal(img.crop(box), mask, value):
+            return False
+        smask = _smask_xref(doc, xref)
+        if smask is not None:
+            alpha = fitz.Pixmap(doc, smask)
+            a = Image.frombytes("L", (alpha.width, alpha.height), alpha.samples)
+            abox, amask = _scaled_mask(mask, box, img.size, a.size)
+            if not _all_equal(a.crop(abox), amask, 255):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+class HiddenPixels:
+    """La contención en apply (ver la sección), página a página."""
+
+    def __init__(self, doc, plan, zones_by_page):
+        self.doc, self.plan, self.zones = doc, plan, zones_by_page
+        self.scratch = _Scratch(doc) if plan else None
+        self.cache = {}      # xref -> [(máscara de borrado, copia)]
+        self.full = {}       # xref -> copia con todos los píxeles de las zonas borrados
+        self.deferred = {}   # xref -> páginas que no muestran nada de las zonas
+        self.checked = set()  # copias comprobadas con erased_in antes de recomprimirlas
+        self._zone_pixels = {}
+
+    def zone_pixels(self, x):
+        if x not in self._zone_pixels:
+            self._zone_pixels[x] = zone_mask(self.plan[x], self.zones)
+        return self._zone_pixels[x]
+
+    def _copy(self, xref, x, mask):
+        box = self.plan[x]["box"]
+        w, h = self.plan[x]["size"]
+        return self.scratch.copy(xref, w, h, mask_rects(mask, box))
+
+    def after_redaction(self, page, pairs):
+        """Tras apply_redactions: en cada copia que ha dejado, borra lo que la página no muestra
+        de las zonas (también lo que MuPDF haya dejado de una zona de la página). Devuelve las
+        parejas (copia, original) con las copias que la sustituyen."""
+        doc, out = self.doc, []
+        zones = self.zones.get(page.number, [])
+        for copy, original in pairs:
+            x = original[0]
+            if x in self.plan:
+                zp = self.zone_pixels(x)
+                box = self.plan[x]["box"]
+                erase = erase_mask(self.plan[x], page.number, zones, zp)
+                # apply_redactions solo borra lo que tocan las zonas de esta página: si hay que
+                # borrar más (lo que no muestra de las de otras), la copia se rehace sin mirarla.
+                own = _new_mask(box)
+                for p in self.plan[x]["draws"].get(page.number, ()):
+                    _draw_zones(own, box, p, zones)
+                ok = erase is None or (_minus(erase, own).getbbox() is None
+                                       and erased_in(doc, copy[0], box, erase))
+                if not ok:
+                    new = self._copy(copy[0], x, erase)
+                    if new is not None and retarget_image(doc, page, copy[0], new):
+                        _free(doc, copy[0])
+                        copy = (new,) + tuple(copy[1:])
+                        ok = erased_in(doc, new, box, erase)
+                if ok:
+                    self.checked.add(copy[0])
+                if erase is not None and _same_mask(erase, zp):
+                    self.full.setdefault(x, copy[0])
+                # Si la página sigue usando la original (otro dibujo que no tocaba la zona),
+                # también la copia: lo que no muestra ya está borrado en ella.
+                if any(im[0] == x for im in page.get_images(full=True)):
+                    retarget_image(doc, page, x, copy[0])
+            out.append((copy, original))
+        return out
+
+    def other_pages(self, page, redacted=()):
+        """Imágenes de las zonas que la página usa sin que apply_redactions las haya copiado en
+        ella: si no muestra entera alguna zona, su propia copia (o, si no muestra ninguna, la
+        común con todas borradas, al final)."""
+        if not self.plan:
+            return
+        doc = self.doc
+        zones = self.zones.get(page.number, [])
+        used = {im[0] for im in page.get_images(full=True)}
+        for x in used & self.plan.keys():
+            if x in redacted:
+                continue
+            entry = self.plan[x]
+            zp = self.zone_pixels(x)
+            erase = erase_mask(entry, page.number, zones, zp)
+            if erase is None:
+                continue
+            if not entry["draws"].get(page.number) or _same_mask(erase, zp):
+                self.deferred.setdefault(x, []).append(page.number)
+                continue
+            copy = next((c for m, c in self.cache.get(x, ()) if _same_mask(m, erase)), None)
+            if copy is None:
+                copy = self._copy(x, x, erase)
+                if copy is None:
+                    continue
+                if erased_in(doc, copy, entry["box"], erase):
+                    self.checked.add(copy)
+                recompress_copy(doc, copy, *entry["size"], x, doc.xref_get_key(x, "Filter")[1])
+                self.cache.setdefault(x, []).append((erase, copy))
+            retarget_image(doc, page, x, copy)
+
+    def finish(self):
+        """Las páginas que no muestran nada de las zonas: la copia con todas borradas (la de una
+        página censurada, si hay alguna así). Quita la página auxiliar."""
+        doc = self.doc
+        for x, numbers in self.deferred.items():
+            copy = self.full.get(x)
+            if copy is None:
+                copy = self._copy(x, x, self.zone_pixels(x))
+                if copy is None:
+                    continue
+                if erased_in(doc, copy, self.plan[x]["box"], self.zone_pixels(x)):
+                    self.checked.add(copy)
+                recompress_copy(doc, copy, *self.plan[x]["size"], x, doc.xref_get_key(x, "Filter")[1])
+            for n in numbers:
+                retarget_image(doc, doc[n], x, copy)
+        if self.scratch:
+            self.scratch.close()
+
+    def checked_digests(self):
+        """Huellas (SHA-256 de los bytes del flujo, ya recomprimido) de las copias comprobadas
+        con erased_in que siguen en el documento: hidden_image_pixels no las vuelve a decodificar
+        (recomprimir un píxel borrado no devuelve el original). Una copia que save() vuelva a
+        comprimir (las que quedan sin comprimir) cambia de bytes y se decodifica."""
+        doc, out = self.doc, set()
+        for x in self.checked:
+            try:
+                if doc.xref_is_stream(x):
+                    out.add(hashlib.sha256(doc.xref_stream_raw(x)).hexdigest())
+            except Exception:
+                pass
+        return out
+
+
+# Comparación con la original en hidden_image_pixels. Copias sin pérdida (o la original sin
+# tocar): un píxel de una zona con el mismo valor que en la original y distinto del borrado es
+# un resto. Copias con pérdida (JPEG, JPEG 2000), en gris: a LOSSY_CLOSE o menos de la
+# original, donde la original está a LOSSY_FAR o más del blanco del borrado, y a LOSSY_MARGIN px
+# o más del borde de la parte borrada (allí la recompresión mezcla los dos lados). Una copia que
+# conserva la zona la conserva entera: basta un píxel así.
+LOSSY_CLOSE = 16
+LOSSY_FAR = 64
+LOSSY_MARGIN = 2
+# Una imagen de la salida viene de una original si, reducidas a SIMILAR_SIZE px de lado y fuera
+# de las zonas, se diferencian de media SIMILAR_MAX_DIFF niveles de gris o menos.
+SIMILAR_SIZE = 64
+SIMILAR_MAX_DIFF = 8
+
+
+def _gray(img):
+    return img if img.mode == "L" else img.convert("RGB").convert("L")
+
+
+def _similar(a, b, box):
+    """¿Viene b de a? Las dos en gris, reducidas, comparadas fuera de box. Si todo es zona, sí."""
+    size = (min(SIMILAR_SIZE, a.width), min(SIMILAR_SIZE, a.height))
+    ta, tb = _gray(a).resize(size, Image.BOX), _gray(b).resize(size, Image.BOX)
+    outside = Image.new("L", size, 255)
+    t = _scaled_box(box, a.size, size)
+    ImageDraw.Draw(outside).rectangle((t[0], t[1], t[2] - 1, t[3] - 1), fill=0)
+    if outside.getbbox() is None:
+        return True
+    return ImageStat.Stat(ImageChops.difference(ta, tb), mask=outside).mean[0] <= SIMILAR_MAX_DIFF
+
+
+def _kept(orig, out, value, box, mask, lossy):
+    """¿Conserva out (una imagen que viene de orig) algún píxel de mask con su valor original?"""
+    a, b = orig.crop(box), out.crop(box)
+    if lossy:
+        ga, gb = _gray(a), _gray(b)
+        close = ImageChops.difference(ga, gb).point(lambda v: 255 if v <= LOSSY_CLOSE else 0)
+        far = ga.point(lambda v: 255 if v <= 255 - LOSSY_FAR else 0)
+        inner = mask.convert("L").filter(ImageFilter.MinFilter(2 * LOSSY_MARGIN + 1))
+        hit = ImageChops.multiply(ImageChops.multiply(close, far), inner)
+        return hit.getbbox() is not None
+    same = _max_band(ImageChops.difference(a, b)).point(lambda v: 255 if v == 0 else 0).convert("1")
+    hit = ImageChops.logical_and(ImageChops.logical_and(same, _differs(a, value)), mask)
+    return hit.getbbox() is not None
+
+
+def _alpha_of(doc, xref, bands):
+    """Alfa de una imagen: su SMask, su /Mask de máscara o el del Pixmap (/Mask de colores)."""
+    for key in ("SMask", "Mask"):
+        t, v = doc.xref_get_key(xref, key)
+        if t == "xref":
+            pix = fitz.Pixmap(doc, int(v.split()[0]))
+            return Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    return bands[1]
+
+
+def hidden_image_pixels(input_path, output_path, plan, zones_by_page, input_images, checked=frozenset()):
+    """¿Queda en la salida algún píxel de una zona con su valor original que no se vea?
+
+    Por cada imagen original que toca una zona (plan, de hidden_pixels_plan) y cada imagen de la
+    salida que viene de ella (mismo tamaño y tipo, y parecida fuera de las zonas): ningún píxel
+    de las zonas puede conservar su valor original, salvo los que se ven en alguna página que la
+    usa (no los que caen bajo una zona de esa página). input_images: {página: {(ancho, alto,
+    máscara): xrefs}} de la entrada, para saber de qué original viene cada imagen. checked:
+    huellas de las copias ya comprobadas antes de recomprimirlas (HiddenPixels.checked_digests),
+    que no se vuelven a decodificar. Cierra en fallo: una imagen que no se puede decodificar o
+    comparar cuenta como resto.
+    """
+    entries = plan
+    if not entries:
+        return False
+    by_kind = {}
+    for x, e in entries.items():
+        by_kind.setdefault(e["kind"], []).append(x)
+    out_doc, in_doc = fitz.open(output_path), fitz.open(input_path)
+    try:
+        # original -> {imagen de la salida: [páginas que la usan, viene seguro de la original]}
+        candidates = {}
+        for page in out_doc:
+            for xref, kind in page_image_kinds(out_doc, page):
+                if kind not in by_kind:
+                    continue
+                # Viene de una imagen del mismo tipo que usaba la página en la entrada (seguro, si
+                # solo usaba esa); si no usaba ninguna, de cualquiera.
+                inputs = input_images.get(page.number, {}).get(kind)
+                for x in (inputs & entries.keys() if inputs else by_kind[kind]):
+                    c = candidates.setdefault(x, {}).setdefault(xref, [set(), False])
+                    c[0].add(page.number)
+                    c[1] = c[1] or inputs == {x}
+        traced = {}
+        for x, outs in candidates.items():
+            entry = entries[x]
+            box = entry["box"]
+            zp = zone_mask(entry, zones_by_page)
+            orig = orig_alpha = None
+            for j, (numbers, sure) in outs.items():
+                if checked and hashlib.sha256(out_doc.xref_stream_raw(j)).hexdigest() in checked:
+                    continue
+                shown = _new_mask(box)
+                for n in numbers:
+                    if n not in traced:
+                        traced[n] = placements(out_doc[n])
+                    ps, visible = traced[n]
+                    view = {"box": box, "draws": {n: [p for p in ps if p.xrefs == {j}]},
+                            "visible": {n: visible}}
+                    erase = erase_mask(view, n, zones_by_page.get(n, []), zp)
+                    shown = ImageChops.logical_or(shown, zp if erase is None else _minus(zp, erase))
+                tight = _tight(box, _minus(zp, shown))
+                if tight is None:
+                    continue
+                hbox, hidden = tight
+                try:
+                    if orig is None:
+                        orig = _pix_bands(fitz.Pixmap(in_doc, x))
+                        if orig is None:
+                            return True
+                        orig_alpha = _alpha_of(in_doc, x, orig)
+                    bands = _pix_bands(fitz.Pixmap(out_doc, j))
+                except Exception:
+                    return True
+                # Otro espacio de color: no viene de esta original (una copia lo conserva).
+                if bands is None or bands[0].mode != orig[0].mode:
+                    continue
+                if not sure and not _similar(orig[0], bands[0], box):
+                    continue
+                lossy = any(f in out_doc.xref_get_key(j, "Filter")[1] for f in ("DCT", "JPX"))
+                if _kept(orig[0], bands[0], orig[2], hbox, hidden, lossy):
+                    return True
+                smask = _smask_xref(out_doc, j)
+                if orig_alpha is not None and smask is not None:
+                    pix = fitz.Pixmap(out_doc, smask)
+                    alpha = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+                    if alpha.size != orig_alpha.size:
+                        return True
+                    abox, amask = _scaled_mask(hidden, hbox, orig[0].size, alpha.size)
+                    if _kept(orig_alpha, alpha, 255, abox, amask, False):
+                        return True
+    finally:
+        out_doc.close()
+        in_doc.close()
+    return False
 
 
 # ==========================================
@@ -2047,11 +3174,163 @@ def item_zone(doc, item):
     return page, rect
 
 
+# Aviso previo con imágenes compartidas (decisión del 2026-10-27). apply_redactions deja en
+# cada página censurada que usa una imagen compartida su propia copia entera de la imagen: con
+# un fondo de página común a muchas páginas, la salida se multiplica (×80 con 120 páginas en
+# docs/estudio-anonimizar-tamano.md). Antes de censurar se estima la salida, el tiempo y la
+# memoria de esas copias y, si pasan de estos límites, apply no censura nada y server.js
+# responde 422 SHARED_IMAGE_TOO_LARGE (en vez de acabar en un 504 tras el tope).
+SHARED_REFUSAL = "SHARED_IMAGE_TOO_LARGE"
+# Una zona toca una imagen que la contención de la sección 4b no puede copiar por página (en
+# línea en un Form XObject común, o dentro de un patrón común): apply no censura nada.
+UNSUPPORTED_REFUSAL = "SHARED_IMAGE_UNSUPPORTED"
+# Motivo de la verificación final (leaks) cuando hidden_image_pixels encuentra un resto: server.js
+# lo trata como cualquier otro (422 REDACT_NOT_VERIFIED) y solo lo escribe en el log.
+HIDDEN_PIXELS_LEAK = "REDACT_HIDDEN_PIXELS"
+SHARED_MAX_BYTES = 150_000_000
+SHARED_MAX_SECONDS = 180
+# Segundos de apply por copia y megapíxel en producción: medidos en local con el fondo de 120
+# páginas del estudio (2480 × 3508, una copia por página, zonas en todas): 57,6 s, 0,0552 s por
+# megapíxel y copia, por 1,3 (producción frente a local, CLAUDE.md). Con pico_memoria.py de
+# scripts/estudio-anonimizar-tamano/ (2026-10-27).
+SHARED_SECONDS_PER_MPX = 0.072
+# Pico de memoria de apply / salida estimada, con el mismo caso: 804 MB (RSS máximo) / 103 MB
+# estimados.
+SHARED_MEMORY_FACTOR = 7.8
+# Segundos de la contención (sección 4b) por página que usa una imagen compartida y megapíxel de
+# sus zonas (las máscaras de lo que no muestra cada página): medido con 11_form_compartido del
+# banco (120 págs., foto de 4000 × 2160, zonas en todas): +5,7 s en local frente a la rama base,
+# 0,0055 s, por 1,3 de producción (2026-10-28, fix/anonimizar-imagen-compartida).
+SHARED_PAGE_SECONDS_PER_MPX = 0.007
+# Límite de memoria por trabajo: el 70 % de la memoria del contenedor (su mem_limit, leído del
+# cgroup) entre los trabajos que la API deja correr a la vez, que server.js pasa en
+# MOTOR_MAX_JOBS (su HEAVY_MAX_CONCURRENT). En producción, 6 GiB y 3: 1,5 GB por trabajo, unos
+# 193 MB de salida estimada.
+SHARED_MEMORY_SHARE = 0.7
+MAX_JOBS_ENV = "MOTOR_MAX_JOBS"
+CGROUP_MEMORY_FILES = ("/sys/fs/cgroup/memory.max",  # cgroup v2
+                       "/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
+
+
+def container_memory():
+    """Bytes de memoria del contenedor: el límite del cgroup (v2 o v1) o, sin límite ("max" o
+    un valor por encima de la RAM, como el de v1 sin límite), la RAM física. None si no se sabe
+    (p. ej. en Windows, sin cgroup ni os.sysconf)."""
+    try:
+        physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        physical = None
+    for path in CGROUP_MEMORY_FILES:
+        try:
+            with open(path, encoding="ascii") as f:
+                value = f.read().strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if value.isdigit() and (physical is None or int(value) < physical):
+            return int(value)
+        break
+    return physical
+
+
+def max_jobs():
+    """Trabajos que pueden correr a la vez (MOTOR_MAX_JOBS); 1 sin la variable o si no vale."""
+    try:
+        return max(1, int(os.environ.get(MAX_JOBS_ENV, "1")))
+    except ValueError:
+        return 1
+
+
+def shared_max_memory():
+    """Memoria máxima de un trabajo para el aviso previo; None si no se sabe la del contenedor."""
+    memory = container_memory()
+    return None if memory is None else int(SHARED_MEMORY_SHARE * memory / max_jobs())
+
+
+def shared_image_estimate(doc, zones_by_page, input_bytes):
+    """Estimación de lo que añaden las imágenes compartidas entre páginas, antes de censurar.
+
+    Por cada imagen que usa más de una página (también desde un Form XObject compartido): una
+    copia del tamaño de su flujo, y su coste en tiempo por megapíxel, por cada página con una
+    zona que la toca. Dónde se dibuja: las imágenes de la página con su mismo ancho y alto (sin
+    decodificar nada: get_image_rects calcula la huella de los píxeles, 0,1-0,2 s por página
+    con un fondo de 300 ppp). En una página girada, o si no se encuentra, cualquier zona de la
+    página cuenta como que la toca. Devuelve {bytes, seconds, memory, copies, max_memory}:
+    bytes es la entrada más las copias; max_memory, el límite de memoria de este trabajo
+    (shared_max_memory).
+    """
+    pages_by_image = {}
+    for page in doc:
+        for xref in {im[0] for im in page.get_images(full=True)}:
+            pages_by_image.setdefault(xref, []).append(page.number)
+    shared = {x: n for x, n in pages_by_image.items() if len(n) > 1}
+    infos = {}  # página -> imágenes dibujadas, con un TextPage nuevo (get_image_info guarda caché)
+
+    def places(n, size):
+        page = doc[n]
+        if page.rotation:
+            return []
+        if n not in infos:
+            infos[n] = page.get_textpage(flags=fitz.TEXT_PRESERVE_IMAGES).extractIMGINFO()
+        return [fitz.Rect(i["bbox"]) for i in infos[n] if (i["width"], i["height"]) == size]
+
+    est = {"bytes": input_bytes, "seconds": 0.0, "copies": 0}
+    for xref, numbers in shared.items():
+        width = int(doc.xref_get_key(xref, "Width")[1] or 0)
+        height = int(doc.xref_get_key(xref, "Height")[1] or 0)
+        copies = 0
+        for n in numbers:
+            zones = zones_by_page.get(n)
+            if not zones:
+                continue
+            rects = places(n, (width, height))
+            if not rects or any(z.intersects(r) for z in zones for r in rects):
+                copies += 1
+        if copies < 2:
+            continue
+        est["copies"] += copies
+        est["bytes"] += copies * len(doc.xref_stream_raw(xref) or b"")
+        est["seconds"] += copies * width * height / 1e6 * SHARED_SECONDS_PER_MPX
+    est["memory"] = est["bytes"] * SHARED_MEMORY_FACTOR
+    est["seconds"] = round(est["seconds"], 1)
+    est["max_memory"] = shared_max_memory()
+    return est
+
+
+def add_contention_copies(doc, est, plan, zones_by_page):
+    """Suma a la estimación de shared_image_estimate lo de la contención (sección 4b): sus copias
+    (contention_copies), con el mismo coste por copia, y lo que cuesta calcular, en cada página
+    que usa una imagen compartida, qué no muestra (SHARED_PAGE_SECONDS_PER_MPX por megapíxel de
+    las zonas). Devuelve cuántas copias ha sumado."""
+    extra = contention_copies(plan, zones_by_page)
+    seconds = 0.0
+    for x, entry in plan.items():
+        n = extra.get(x, 0)
+        w, h = entry["size"]
+        b = entry["box"]
+        est["copies"] += n
+        est["bytes"] += n * len(doc.xref_stream_raw(x) or b"")
+        seconds += n * w * h / 1e6 * SHARED_SECONDS_PER_MPX
+        if len(entry["draws"]) > 1:
+            seconds += len(entry["draws"]) * (b[2] - b[0]) * (b[3] - b[1]) / 1e6 * SHARED_PAGE_SECONDS_PER_MPX
+    est["seconds"] = round(est["seconds"] + seconds, 1)
+    est["memory"] = est["bytes"] * SHARED_MEMORY_FACTOR
+    return sum(extra.values())
+
+
+def shared_image_too_large(est):
+    too_much_memory = est["max_memory"] is not None and est["memory"] > est["max_memory"]
+    return est["copies"] > 0 and (est["bytes"] > SHARED_MAX_BYTES or est["seconds"] > SHARED_MAX_SECONDS
+                                  or too_much_memory)
+
+
 def apply(input_path, output_path, items):
     """Censura, limpia y verifica. Devuelve el informe que lee server.js.
 
-    Si la verificación final encuentra un término censurado, borra la salida y devuelve
-    verified=False: server.js no envía nada.
+    Si la verificación final encuentra un término censurado (o un píxel de una zona oculto en una
+    imagen, HIDDEN_PIXELS_LEAK), borra la salida y devuelve verified=False: server.js no envía
+    nada. Si las copias de las imágenes compartidas entre páginas pasarían de los límites
+    (shared_image_too_large), no censura nada y devuelve refused=SHARED_REFUSAL; si una zona toca
+    una imagen que no se puede copiar por página, refused=UNSUPPORTED_REFUSAL.
     """
     doc = fitz.open(input_path)
 
@@ -2089,8 +3368,34 @@ def apply(input_path, output_path, items):
             applied_count += 1
         except Exception as e:
             failed_items.append({"id": item.get("id"), "error": str(e)})
+
+    # Antes de censurar: imágenes compartidas que se copiarían en demasiadas páginas.
+    estimate = shared_image_estimate(doc, zones_by_page, os.path.getsize(input_path))
+    if shared_image_too_large(estimate):
+        doc.close()
+        return {"success": False, "verified": False, "refused": SHARED_REFUSAL,
+                "estimate": {k: None if v is None else round(v) for k, v in estimate.items()},
+                "applied": 0, "failed": failed_items}
+
     for page_num, rect in pending:
         doc[page_num].add_redact_annot(rect, fill=False)
+
+    # Píxeles de las zonas que otras páginas no muestran de una imagen compartida (sección 4b):
+    # lo que hay que copiar, también para el aviso previo.
+    # Si una zona toca una imagen que no se puede copiar por página, no se censura nada:
+    # server.js responde 422 SHARED_IMAGE_UNSUPPORTED (como el aviso previo).
+    plan, unsupported, input_images = hidden_pixels_plan(doc, zones_by_page)
+    if unsupported:
+        doc.close()
+        return {"success": False, "verified": False, "refused": UNSUPPORTED_REFUSAL,
+                "applied": 0, "failed": failed_items}
+    if plan:
+        add_contention_copies(doc, estimate, plan, zones_by_page)
+        if shared_image_too_large(estimate):
+            doc.close()
+            return {"success": False, "verified": False, "refused": SHARED_REFUSAL,
+                    "estimate": {k: None if v is None else round(v) for k, v in estimate.items()},
+                    "applied": 0, "failed": failed_items}
 
     # Lo que hay bajo cada zona también es un término: cubre las censuras manuales (cuyo
     # "text" es una etiqueta) y el texto real bajo cada hallazgo.
@@ -2128,7 +3433,11 @@ def apply(input_path, output_path, items):
                 if p and os.path.exists(p):
                     os.remove(p)
 
-    for page in doc:
+    page_count = doc.page_count
+    hidden = HiddenPixels(doc, plan, zones_by_page)
+    for number in range(page_count):  # sin la página auxiliar que añade HiddenPixels
+        page = doc[number]
+        redacted = set()
         if page.number in zones_by_page:
             # CRÍTICO: images=fitz.PDF_REDACT_IMAGE_PIXELS garantiza la destrucción
             # a nivel de píxel del escaneo subyacente. No se puede recuperar el dato tapado.
@@ -2143,7 +3452,11 @@ def apply(input_path, output_path, items):
             # Opacidad absoluta, encima de todo y donde se ve cada zona (paint_rects).
             paint_zones(page, zones_by_page[page.number])
             restore_fills(page, fills, zones_by_page[page.number])
-            recompress_redacted_images(doc, page, before)
+            # Copias de imágenes compartidas sin lo que la página no muestra (sección 4b).
+            pairs = hidden.after_redaction(page, redacted_pairs(page, before))
+            recompress_pairs(doc, pairs)
+            redacted = {original[0] for _, original in pairs}
+        hidden.other_pages(page, redacted)
         if page.number in hidden_by_page:
             # Solo el texto y sin relleno: la zona no se ve, y no debe tocar imágenes ni
             # trazos que sí se vean (un fondo de página que llega fuera del CropBox). Estas
@@ -2152,6 +3465,8 @@ def apply(input_path, output_path, items):
             for rect in hidden_by_page[page.number]:
                 page.add_redact_annot(rect, fill=False)
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+    hidden.finish()
+    checked = hidden.checked_digests()
 
     remove_outline_terms(doc, terms)
     doc = compact_xref(doc)
@@ -2197,10 +3512,16 @@ def apply(input_path, output_path, items):
         "keywords": ""
     })
 
-    doc.save(output_path, garbage=4, deflate=True, clean=True)
+    # use_objstms: los objetos que no son flujos van en flujos de objetos comprimidos (-0 a -8 %,
+    # sin coste de tiempo; docs/estudio-anonimizar-tamano.md). La salida no conserva PDF/A
+    # (scrub quita el XMP): no hay que respetar la restricción de PDF/A-1.
+    doc.save(output_path, garbage=4, deflate=True, clean=True, use_objstms=1)
     doc.close()
 
+    # Sobre los bytes ya guardados, con sus flujos de objetos.
     leaks = verify_redaction(output_path, zones_by_page, terms)
+    if hidden_image_pixels(input_path, output_path, plan, zones_by_page, input_images, checked):
+        leaks = sorted(set(leaks) | {HIDDEN_PIXELS_LEAK})
     if leaks:
         os.remove(output_path)
         return {"success": False, "verified": False, "leaks": leaks,

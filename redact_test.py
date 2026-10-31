@@ -9,6 +9,7 @@ import struct
 import tempfile
 import unittest
 import zlib
+from collections import Counter
 
 import pymupdf as fitz
 
@@ -212,6 +213,32 @@ class VerificacionFinal(unittest.TestCase):
             # pdf_objects: el barrido de objetos también ve el término en esos mismos sitios.
             ["attachments", "form_fields", "metadata_info", "metadata_xmp", "outline", "page_text", "pdf_objects"],
         )
+
+    def test_salida_con_flujos_de_objetos_verificada_sobre_sus_bytes(self):
+        """El último guardado usa use_objstms=1: los objetos sin flujo van comprimidos dentro de
+        flujos de objetos, y la verificación final, sobre el archivo ya guardado, los sigue viendo."""
+        src, out = tmp_path(self, "in.pdf"), tmp_path(self, "out.pdf")
+        doc = fitz.open()
+        doc.new_page().insert_text((60, 60), f"Expediente {TERM} de prueba")
+        # Una clave del catálogo que ninguna limpieza conoce: solo la ve el barrido de objetos.
+        doc.xref_set_key(doc.pdf_catalog(), "Extra", f"({TERM})")
+        doc.save(src)
+        doc.close()
+        report = redact.apply(src, out, search_items(src, TERM))
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["leaks"], ["pdf_objects"])
+        self.assertFalse(os.path.exists(out))
+        # Sin esa clave: verificada, con flujos de objetos y sin el término en claro.
+        doc = fitz.open(src)
+        doc.xref_set_key(doc.pdf_catalog(), "Extra", "null")
+        doc.saveIncr()
+        doc.close()
+        report = redact.apply(src, out, search_items(src, TERM))
+        self.assertTrue(report["verified"], report)
+        with open(out, "rb") as f:
+            data = f.read()
+        self.assertIn(b"/ObjStm", data)
+        self.assertNotIn(TERM.encode(), data)
 
     def test_aparicion_no_seleccionada_no_es_fuga(self):
         """El usuario puede desmarcar una aparición: si queda fuera de las zonas, no es fuga."""
@@ -670,6 +697,382 @@ class TamanoDeSalidaLote2d(unittest.TestCase):
                 self.assertEqual(same[0], samples)
 
 
+# ==========================================
+# Conteo de colores con corte (_few_colors)
+# ==========================================
+def old_few_colors(pix):
+    """La decisión de antes de _few_colors: PyMuPDF contaba todos los colores."""
+    return pix.color_count() <= redact.MAX_LOSSLESS_COLORS
+
+
+def as_pixmap(img):
+    cs = {"L": fitz.csGRAY, "RGB": fitz.csRGB, "CMYK": fitz.csCMYK}[img.mode]
+    return fitz.Pixmap(cs, img.width, img.height, img.tobytes(), 0)
+
+
+def code_image(kind, module):
+    """QR o Code128 en gris de 8 bits (2 colores), con los de lossless_images_test."""
+    from PIL import Image
+    import lossless_images_test as lit
+    bits = lit.code_bits(kind, module)
+    img = Image.new("L", (len(bits[0]), len(bits)))
+    img.putdata([255 if v else 0 for row in bits for v in row])
+    return img
+
+
+def seal_image(n_colors, size=300):
+    """Sello de anillos concéntricos con n_colors colores RGB (el primero, blanco)."""
+    import random
+    from PIL import Image
+    rng = random.Random(n_colors)
+    palette = [(255, 255, 255)] + [tuple(rng.randrange(256) for _ in range(3)) for _ in range(n_colors - 1)]
+    img = Image.new("RGB", (size, size))
+    img.putdata([palette[((x - size // 2) ** 2 + (y - size // 2) ** 2) // 300 % n_colors]
+                 for y in range(size) for x in range(size)])
+    return img
+
+
+def n_color_image(mode, n, channel=-1):
+    """n colores distintos que solo difieren en un canal (por defecto, el último), en franjas;
+    el último solo en el último píxel."""
+    from PIL import Image
+    bands = len(mode)
+    colors = [tuple(i if c == channel % bands else 0 for c in range(bands)) for i in range(n)]
+    w, h = 64, 48
+    total = w * h
+    pixels = [colors[i * (n - 1) // (total - 1)] for i in range(total)]
+    img = Image.new(mode, (w, h))
+    img.putdata(pixels if bands > 1 else [p[0] for p in pixels])
+    return img
+
+
+def color_corpus():
+    """[(nombre, Pixmap)] como llegan a _encode_jpeg (gris, RGB o CMYK de 8 bits sin alfa):
+    escaneos y fotos, también decodificados de JPEG y JPEG 2000 por MuPDF; QR y Code128;
+    sellos; B/N; y los bordes del umbral (16 y 17 colores, en cada canal)."""
+    import random
+    from PIL import Image
+    corpus = []
+
+    def add(name, img):
+        corpus.append((name, as_pixmap(img)))
+        for fmt, kw in (("JPEG", {"quality": 85}), ("JPEG2000", {"irreversible": False, "no_jp2": True})):
+            try:
+                pix = fitz.Pixmap(encode(img, fmt, **kw))
+            except Exception:  # p. ej. CMYK, que Pillow no escribe en JPEG 2000
+                continue
+            if pix.alpha == 0 and pix.n in (1, 3, 4):
+                corpus.append((f"{name} {fmt}", pix))
+
+    for mode in ("L", "RGB", "CMYK"):
+        add(f"escaneo {mode}", scan_image(mode))
+    rng = random.Random(5)
+    add("foto RGB", Image.frombytes("RGB", (300, 200), bytes(rng.randrange(256) for _ in range(300 * 200 * 3))))
+    for kind, module in (("qr", 3), ("qr", 2), ("bar", 2)):
+        code = code_image(kind, module)
+        for mode in ("L", "RGB", "CMYK"):
+            add(f"{kind} {module}px {mode}", code.convert(mode))
+    for n in (3, 12, 15, 16, 17, 40):
+        add(f"sello {n} colores", seal_image(n))
+    bits = Image.new("1", (SCAN_W, SCAN_H), 1)
+    bits.paste(0, (100, 100, 600, 900))
+    for x in range(0, SCAN_W, 40):
+        bits.paste(0, (x, 1000, x + 20, 1700))
+    add("B/N", bits.convert("L"))
+    for mode in ("L", "RGB", "CMYK"):
+        for channel in range(len(mode)):
+            for n in (1, 2, 15, 16, 17, 18, 255):
+                corpus.append((f"{n} colores {mode} canal {channel}", as_pixmap(n_color_image(mode, n, channel))))
+        corpus.append((f"1 píxel {mode}", as_pixmap(Image.new(mode, (1, 1)))))
+    return corpus
+
+
+class ConteoDeColores(unittest.TestCase):
+    """_few_colors para en el color 17 (Pixmap.color_count los contaba todos: 2,2-2,5 s por
+    foto de página entera). Tiene que decidir lo mismo que antes en todas las imágenes; el
+    banco del estudio, con scripts/estudio-anonimizar-tamano/equivalencia_colores.py."""
+
+    def test_misma_decision_que_color_count(self):
+        corpus = color_corpus()
+        sides = Counter()
+        for name, pix in corpus:
+            with self.subTest(name):
+                old = old_few_colors(pix)
+                self.assertEqual(redact._few_colors(redact._pil(pix)), old)
+                sides[old] += 1
+        self.assertGreater(sides[True], 20)  # el corpus cubre los dos lados del umbral
+        self.assertGreater(sides[False], 20)
+
+    def test_misma_decision_con_las_copias_censuradas(self):
+        """Las copias que deja apply_redactions, tal como llegan a _few_colors en apply."""
+        from unittest import mock
+        from PIL import Image
+        rgb, gray, cmyk = scan_image("RGB"), scan_image("L"), scan_image("CMYK")
+        canvas = Image.new("L", (SCAN_W, SCAN_H), 255)
+        canvas.paste(code_image("qr", 3), (400, 600))
+        qr_rgb = canvas.convert("RGB")
+        # Con un marco gris (3 colores): con solo blanco y negro, MuPDF deja la copia en 1 bit
+        # (va a CCITT G4 y no pasa por _few_colors).
+        canvas.paste(128, (380, 580, 390, 760))
+        rings = Image.new("RGB", (SCAN_W, SCAN_H), (255, 255, 255))
+        rings.paste(seal_image(12), (700, 900))
+        lossless = {"no_jp2": True, "irreversible": False}
+        page = [
+            (encode(rgb, "JPEG", quality=85, subsampling=2), "/DCTDecode", "/DeviceRGB"),
+            (encode(gray, "JPEG", quality=75), "/DCTDecode", "/DeviceGray"),
+            (encode(cmyk, "JPEG", quality=90), "/DCTDecode", "/DeviceCMYK"),
+            (encode(rgb, "JPEG2000", **lossless), "/JPXDecode", "/DeviceRGB"),
+            (encode(rgb, "JPEG2000", quality_mode="rates", quality_layers=[20], irreversible=True, no_jp2=True),
+             "/JPXDecode", "/DeviceRGB"),
+            (encode(canvas, "JPEG2000", **lossless), "/JPXDecode", "/DeviceGray"),  # QR
+            (encode(rings, "JPEG2000", **lossless), "/JPXDecode", "/DeviceRGB"),  # sello
+            # QR en JPEG: a calidad 95, MuPDF lo decodifica con 15 colores.
+            (encode(qr_rgb, "JPEG", quality=95), "/DCTDecode", "/DeviceRGB"),
+            (encode(qr_rgb, "JPEG", quality=60), "/DCTDecode", "/DeviceRGB"),
+        ]
+        # Una imagen por página, cada una a página completa bajo la zona.
+        src = tmp_path(self, "in.pdf")
+        make_image_pdf(src, [[(d, f, cs, None)] for d, f, cs in page])
+        seen = []
+        real = redact._few_colors
+
+        def spy(img):
+            new = real(img)
+            seen.append((img.mode, new, old_few_colors(as_pixmap(img))))
+            return new
+
+        out = tmp_path(self, "out.pdf")
+        with mock.patch.object(redact, "_few_colors", spy):
+            report = redact.apply(src, out, zone_items(len(page)))
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(len(seen), len(page))
+        self.assertEqual([s for s in seen if s[1] != s[2]], [])
+        self.assertEqual([s[1] for s in seen], [False] * 5 + [True] * 3 + [False])
+        # El QR, el sello y el QR en JPEG de 15 colores, sin pérdida: Flate y los mismos píxeles
+        # fuera de la zona.
+        for n in (5, 6, 7):
+            filt, _, _, pix = first_image(out, page=n)
+            self.assertEqual(filt, "/FlateDecode")
+            self.assertEqual(pixels_outside_zone(pix).tobytes(), pixels_outside_zone(first_image(src, page=n)[3]).tobytes())
+
+
+# ==========================================
+# Aviso previo con imágenes compartidas (SHARED_IMAGE_TOO_LARGE)
+# ==========================================
+def background_jpeg(seed=10):
+    """Fondo fotográfico de página entera a 300 ppp (2480 × 3508, JPEG q92, unos 0,85 MB), como
+    el de 10_fondo_compartido del banco del estudio (gen_banco.photo)."""
+    import random
+    from PIL import Image, ImageDraw, ImageFilter
+    rng = random.Random(seed)
+    w, h = 2480, 3508
+    base = Image.merge("RGB", [Image.effect_noise((w // 32, h // 32), 60) for _ in range(3)])
+    img = base.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(6))
+    d = ImageDraw.Draw(img)
+    for _ in range(12):
+        x, y, r = rng.randrange(w), rng.randrange(h), rng.randrange(w // 20, w // 5)
+        d.ellipse((x - r, y - r, x + r, y + r), fill=tuple(rng.randrange(256) for _ in range(3)))
+    img = img.filter(ImageFilter.GaussianBlur(3))
+    grain = Image.effect_noise((w, h), 10)
+    return encode(Image.blend(img, Image.merge("RGB", (grain, grain, grain)), 0.06), "JPEG", quality=92)
+
+
+def make_shared_background_pdf(path, pages, image=None):
+    """`pages` páginas A4 con el mismo fondo de página entera (UN objeto imagen para todas) y una
+    línea de texto, como 10_fondo_compartido del estudio (120 págs.)."""
+    doc = fitz.open()
+    image = image or background_jpeg()
+    xref = 0
+    for i in range(pages):
+        page = doc.new_page(width=595, height=842)
+        xref = page.insert_image(page.rect, stream=image, xref=xref)
+        page.insert_text((72, 60), f"Página {i + 1} del expediente de prueba")
+    doc.save(path, garbage=0, deflate=True)
+    doc.close()
+
+
+def manual_zones(pages):
+    """Una zona manual de 200 × 20 pt por página, a una altura distinta en cada una (las de
+    medir.py --manual en el estudio): las copias de la imagen son todas distintas."""
+    return [{"id": f"m{n}", "page": n, "category": "Censura Manual", "text": "Censura Manual",
+             "rect": [100, 90 + (n * 37) % 650, 300, 110 + (n * 37) % 650]} for n in range(pages)]
+
+
+class _Parado(Exception):
+    """Para apply justo después del aviso previo (para no censurar 120 páginas en un test)."""
+
+
+class ImagenCompartidaGrande(unittest.TestCase):
+    """apply_redactions deja una copia entera de una imagen compartida en cada página censurada
+    que la usa: el fondo de 120 páginas del estudio pasaba de 1,1 a 92 MB. Antes de censurar se
+    estima y, por encima de 150 MB, 180 s o la memoria de un trabajo (el 70 % de la del
+    contenedor entre los trabajos a la vez), se rechaza. Con la configuración de producción:
+    6 GiB y HEAVY_MAX_CONCURRENT 3."""
+
+    PRODUCTION_MEMORY = 6 * 2**30
+    PRODUCTION_JOBS = 3
+
+    def setUp(self):
+        from unittest import mock
+        for patcher in (mock.patch.object(redact, "container_memory", return_value=self.PRODUCTION_MEMORY),
+                        mock.patch.dict(os.environ, {redact.MAX_JOBS_ENV: str(self.PRODUCTION_JOBS)})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def estimate(self, src, items):
+        """Estimación que hace apply y su decisión, sin censurar nada si no se rechaza."""
+        from unittest import mock
+        seen = []
+        real = redact.shared_image_too_large
+
+        def spy(est):
+            refused = real(est)
+            seen.append((est, refused))
+            if not refused:
+                raise _Parado
+            return refused
+
+        out = tmp_path(self, "out.pdf")
+        with mock.patch.object(redact, "shared_image_too_large", spy):
+            try:
+                report = redact.apply(src, out, items)
+            except _Parado:
+                report = None
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(os.path.exists(out))
+        return seen[0][0], seen[0][1], report
+
+    def test_caso_del_estudio_de_120_paginas_no_salta(self):
+        """Con el conteo de colores con corte, el caso de 120 páginas da 92 MB en unos 50 s: por
+        debajo de los tres límites."""
+        src = tmp_path(self, "in.pdf")
+        make_shared_background_pdf(src, 120)
+        est, refused, _ = self.estimate(src, manual_zones(120))
+        self.assertFalse(refused, est)
+        self.assertEqual(est["copies"], 120)
+        self.assertLess(est["bytes"], redact.SHARED_MAX_BYTES)
+        self.assertGreater(est["bytes"], 90_000_000)  # 120 copias de unos 0,85 MB
+        self.assertEqual(est["max_memory"], int(0.7 * self.PRODUCTION_MEMORY / self.PRODUCTION_JOBS))
+        self.assertLess(est["memory"], est["max_memory"])
+
+    def test_250_paginas_da_el_error_en_pocos_segundos(self):
+        import time
+        src, out = tmp_path(self, "in.pdf"), tmp_path(self, "out.pdf")
+        make_shared_background_pdf(src, 250)
+        t = time.monotonic()
+        report = redact.apply(src, out, manual_zones(250))
+        elapsed = time.monotonic() - t
+        self.assertEqual(report["refused"], "SHARED_IMAGE_TOO_LARGE")
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["estimate"]["copies"], 250)
+        self.assertGreater(report["estimate"]["bytes"], redact.SHARED_MAX_BYTES)
+        # También pasa del límite de memoria de un trabajo (1,5 GB con 6 GiB y 3 trabajos).
+        self.assertGreater(report["estimate"]["memory"], report["estimate"]["max_memory"])
+        self.assertLess(elapsed, 10)
+        self.assertFalse(os.path.exists(out))
+
+    def test_limite_por_tiempo_y_por_memoria(self):
+        """Cada límite salta solo, aunque los otros dos no."""
+        under = {"copies": 2, "bytes": 1, "seconds": 0, "memory": 0, "max_memory": 1000}
+        self.assertFalse(redact.shared_image_too_large(under))
+        self.assertTrue(redact.shared_image_too_large({**under, "bytes": redact.SHARED_MAX_BYTES + 1}))
+        self.assertTrue(redact.shared_image_too_large({**under, "seconds": redact.SHARED_MAX_SECONDS + 1}))
+        self.assertTrue(redact.shared_image_too_large({**under, "memory": 1001}))
+        # Sin saber la memoria del contenedor, ese límite no cuenta (los otros dos sí).
+        self.assertFalse(redact.shared_image_too_large({**under, "memory": 10**12, "max_memory": None}))
+        # Sin imágenes compartidas que copiar, nunca (aunque la entrada sea grande).
+        self.assertFalse(redact.shared_image_too_large({**under, "copies": 0, "bytes": 10**12}))
+
+    @unittest.skipUnless(hasattr(os, "sysconf"), "sin os.sysconf (Windows): no hay cgroup que leer")
+    def test_limite_de_memoria_con_la_configuracion_real(self):
+        """70 % de la memoria del contenedor (cgroup v2 o v1; sin límite, la RAM física) entre
+        MOTOR_MAX_JOBS (1 sin la variable o si no vale)."""
+        from unittest import mock
+        mock.patch.stopall()  # sin los valores de producción de setUp
+        physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        d = os.path.dirname(tmp_path(self, "x"))
+        v2, v1 = os.path.join(d, "memory.max"), os.path.join(d, "memory.limit_in_bytes")
+        cases = [
+            ({v2: "6442450944\n"}, 6442450944),             # cgroup v2 con mem_limit 6g
+            ({v2: "max\n"}, physical),                       # v2 sin límite
+            ({v1: "6442450944\n"}, 6442450944),             # cgroup v1
+            ({v1: "9223372036854771712\n"}, physical),       # v1 sin límite
+            ({}, physical),                                   # sin cgroup
+        ]
+        for files, expected in cases:
+            with self.subTest(files=files):
+                for path in (v2, v1):
+                    if os.path.exists(path):
+                        os.remove(path)
+                for path, value in files.items():
+                    with open(path, "w") as f:
+                        f.write(value)
+                with mock.patch.object(redact, "CGROUP_MEMORY_FILES", (v2, v1)):
+                    self.assertEqual(redact.container_memory(), expected)
+        for path in (v2, v1):
+            if os.path.exists(path):
+                os.remove(path)
+        for value, jobs in (("3", 3), ("1", 1), ("0", 1), ("tres", 1), (None, 1)):
+            env = {} if value is None else {redact.MAX_JOBS_ENV: value}
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=False):
+                if value is None:
+                    os.environ.pop(redact.MAX_JOBS_ENV, None)
+                self.assertEqual(redact.max_jobs(), jobs)
+        with mock.patch.object(redact, "container_memory", return_value=6 * 2**30), \
+                mock.patch.dict(os.environ, {redact.MAX_JOBS_ENV: "3"}):
+            self.assertEqual(redact.shared_max_memory(), int(0.7 * 6 * 2**30 / 3))
+        with mock.patch.object(redact, "container_memory", return_value=None):
+            self.assertIsNone(redact.shared_max_memory())
+
+    def test_casos_normales_no_lo_disparan(self):
+        """Una imagen por página (escaneo), un logo pequeño repetido en todas las páginas y tapado
+        por una zona en cada una, y el fondo compartido con las zonas en solo 40 páginas."""
+        from PIL import Image
+        cases = {}
+        src = tmp_path(self, "escaneo.pdf")
+        jpeg = encode(scan_image("RGB"), "JPEG", quality=85)
+        make_image_pdf(src, [[(jpeg, "/DCTDecode", "/DeviceRGB", None)] for _ in range(30)])
+        cases["escaneo"] = (src, zone_items(30), 0)
+        src = tmp_path(self, "logo.pdf")
+        doc = fitz.open()
+        logo, xref = encode(Image.new("RGB", (600, 200), (200, 30, 30)), "PNG"), 0
+        for _ in range(60):
+            page = doc.new_page(width=595, height=842)
+            xref = page.insert_image(fitz.Rect(100, 130, 310, 200), stream=logo, xref=xref)
+        doc.save(src)
+        doc.close()
+        cases["logo"] = (src, zone_items(60), 60)  # ZONE toca el logo en cada página
+        src = tmp_path(self, "fondo40.pdf")
+        make_shared_background_pdf(src, 120)
+        cases["fondo en 40 págs."] = (src, zone_items(120)[::3], 40)
+        for name, (src, items, copies) in cases.items():
+            with self.subTest(name):
+                est, refused, _ = self.estimate(src, items)
+                self.assertFalse(refused, est)
+                self.assertEqual(est["copies"], copies)
+
+    def test_imagen_en_un_form_compartido_y_zona_que_no_la_toca(self):
+        """Una imagen dentro de un Form XObject común a todas las páginas también se cuenta; una
+        página cuya zona no toca la imagen no hace copia."""
+        src = tmp_path(self, "base.pdf")
+        make_shared_background_pdf(src, 1)
+        template = fitz.open(src)
+        doc = fitz.open()
+        for _ in range(4):
+            page = doc.new_page(width=595, height=842)
+            page.show_pdf_page(fitz.Rect(0, 0, 595, 421), template, 0)  # mitad superior
+        path = tmp_path(self, "form.pdf")
+        doc.save(path)
+        doc.close()
+        template.close()
+        touching = {"page": 0, "category": "Censura Manual", "text": "Zona", "rect": [100, 100, 200, 120]}
+        away = {"page": 0, "category": "Censura Manual", "text": "Zona", "rect": [100, 600, 200, 620]}
+        items = [{**touching, "page": 0}, {**touching, "page": 1}, {**away, "page": 2}]
+        est, refused, _ = self.estimate(path, items)
+        self.assertFalse(refused)
+        self.assertEqual(est["copies"], 2)
+
+
 class BusquedaConRepeticiones(unittest.TestCase):
     """Un valor que se repite en la página se busca con search_for una sola vez (devuelve todas
     sus apariciones). Antes, una vez por repetición: k llamadas y k² hallazgos que luego se
@@ -982,6 +1385,494 @@ class VerificacionPorRender(unittest.TestCase):
         self.assertFalse(redact.zones_not_black(page, [fitz.Rect(50, 50, 53, 53)]))
         self.assertFalse(redact.zones_not_black(page, [fitz.Rect(400, 400, 500, 500)]))  # sin imagen
         doc.close()
+
+
+# ==========================================
+# Píxeles censurados ocultos en otras páginas (imagen compartida, sección 4b de redact.py)
+# ==========================================
+SHARED_W, SHARED_H = 620, 877  # A4 a 75 ppp
+BAND = 280  # alto (pt) de la franja de la imagen que muestra cada página
+SHARED_ZONE = [100, 100, 300, 130]  # en lo visible de la página 1, dentro de su franja
+
+
+def shared_picture(mode="RGB"):
+    """Fondo con ruido y renglones de «datos» en toda la imagen (sin datos reales)."""
+    from PIL import Image, ImageDraw
+    img = Image.effect_noise((SHARED_W, SHARED_H), 50).convert("RGB")
+    d = ImageDraw.Draw(img)
+    for i, y in enumerate(range(0, SHARED_H, 16)):
+        d.text((10, y), "DATO FICTICIO 12345678Z " * 4, fill=(i * 7 % 60, 0, 90))
+    return img.convert(mode)
+
+
+def shared_stream(fmt):
+    """(claves del diccionario, flujo, filtro) de la imagen compartida en cada formato."""
+    img = shared_picture("CMYK" if fmt == "cmyk" else "L" if fmt == "1bit" else "RGB")
+    if fmt == "flate":
+        return "/ColorSpace /DeviceRGB /BitsPerComponent 8", zlib.compress(img.tobytes()), "/FlateDecode"
+    if fmt == "1bit":
+        bits = img.point(lambda v: 255 if v > 100 else 0).convert("1")
+        return "/ColorSpace /DeviceGray /BitsPerComponent 1", zlib.compress(bits.tobytes()), "/FlateDecode"
+    if fmt == "jpeg":
+        return "/ColorSpace /DeviceRGB /BitsPerComponent 8", encode(img, "JPEG", quality=90), "/DCTDecode"
+    if fmt == "cmyk":
+        return "/ColorSpace /DeviceCMYK /BitsPerComponent 8", encode(img, "JPEG", quality=90), "/DCTDecode"
+    if fmt == "jpx":  # 9/7
+        return ("/ColorSpace /DeviceRGB /BitsPerComponent 8", encode(
+            img, "JPEG2000", irreversible=True, quality_mode="rates", quality_layers=[10], no_jp2=True), "/JPXDecode")
+    raise ValueError(fmt)
+
+
+def _stream_object(doc, xref, keys, data, filt):
+    doc.update_object(xref, f"<< {keys} >>")
+    doc.update_stream(xref, data, compress=False)  # quita /Filter
+    doc.xref_set_key(xref, "Filter", filt)
+
+
+def make_shared_pdf(path, variant, fmt="flate", rotate=0, mask=None, extra=(), pages=3):
+    """`pages` páginas A4 que usan UNA imagen de página entera (y comparten sus recursos); la
+    página i solo muestra la franja i (de BAND pt) de la imagen:
+    - recortes: la imagen entera en la página, con la CropBox en su franja (el caso del estudio);
+    - clip: la imagen entera, con un recorte rectangular a la franja;
+    - fuera: la imagen mide tres páginas de alto y sale por arriba y por abajo;
+    - form: como clip, pero dentro de un Form XObject común a todas las páginas;
+    - patron: la imagen dentro de un patrón de mosaico común.
+    mask: "smask" (alfa con texto) o "alfa" (lo mismo con el color blanco: lo que hay que borrar
+    solo está en el alfa). extra: páginas al final que comparten los recursos: "entera" (dibuja la
+    imagen entera, se ve la zona), "mitad" (solo la mitad izquierda de la imagen: ve media zona)
+    o "sin_dibujar" (no la dibuja).
+    """
+    from PIL import Image, ImageDraw
+    doc = fitz.open()
+    image = doc.get_new_xref()
+    keys, data, filt = shared_stream(fmt)
+    if mask == "alfa":
+        data = zlib.compress(Image.new("RGB", (SHARED_W, SHARED_H), "white").tobytes())
+        keys, filt = "/ColorSpace /DeviceRGB /BitsPerComponent 8", "/FlateDecode"
+    _stream_object(doc, image, f"/Type /XObject /Subtype /Image /Width {SHARED_W} /Height {SHARED_H} {keys}",
+                   data, filt)
+    if mask:
+        alpha = Image.new("L", (SHARED_W, SHARED_H), 255)
+        d = ImageDraw.Draw(alpha)
+        d.ellipse((50, 50, 560, 800), fill=120)
+        for y in range(0, SHARED_H, 30):
+            d.text((20, y), "MASCARA FICTICIA " * 4, fill=0)
+        s = doc.get_new_xref()
+        _stream_object(doc, s, f"/Type /XObject /Subtype /Image /Width {SHARED_W} /Height {SHARED_H} "
+                               "/ColorSpace /DeviceGray /BitsPerComponent 8", zlib.compress(alpha.tobytes()),
+                       "/FlateDecode")
+        doc.xref_set_key(image, "SMask", f"{s} 0 R")
+    draw = {"fuera": "595 0 0 2526 0 {off} cm /Fondo Do"}.get(variant, "595 0 0 842 0 0 cm /Fondo Do")
+    resources = f"/XObject << /Fondo {image} 0 R >>"
+    if variant in ("form", "patron"):
+        holder = doc.get_new_xref()
+        if variant == "form":
+            doc.update_object(holder, f"<< /Type /XObject /Subtype /Form /BBox [0 0 595 842] "
+                                      f"/Resources << /XObject << /Fondo {image} 0 R >> >> >>")
+            resources = f"/XObject << /Fondo {image} 0 R /Plantilla {holder} 0 R >>"
+        else:
+            doc.update_object(holder, f"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+                                      f"/BBox [0 0 595 842] /XStep 595 /YStep 842 "
+                                      f"/Resources << /XObject << /Fondo {image} 0 R >> >> >>")
+            resources = f"/Pattern << /P {holder} 0 R >>"
+        doc.update_stream(holder, b"q 595 0 0 842 0 0 cm /Fondo Do Q")
+    res = doc.get_new_xref()
+    doc.update_object(res, f"<< {resources} >>")
+    for i in range(pages):
+        page = doc.new_page(width=595, height=842)
+        y0 = 842 - (i * BAND + BAND)
+        if variant == "recortes":
+            content = f"q {draw} Q"
+            page.set_cropbox(fitz.Rect(0, i * BAND, 595, i * BAND + BAND))
+        elif variant == "clip":
+            content = f"q 0 {y0} 595 {BAND} re W n {draw} Q"
+        elif variant == "fuera":
+            content = "q " + draw.format(off=-(2 - i) * 842) + " Q"
+        elif variant == "form":
+            content = f"q 0 {y0} 595 {BAND} re W n /Plantilla Do Q"
+        elif variant == "patron":
+            content = f"q /Pattern cs /P scn 0 {y0} 595 {BAND} re f Q"
+        _page_content(doc, page, res, content)
+        if rotate:
+            page.set_rotation(rotate)
+    for kind in extra:
+        page = doc.new_page(width=595, height=842)
+        _page_content(doc, page, res, {"entera": f"q {draw} Q", "mitad": f"q 0 0 200 842 re W n {draw} Q",
+                                      "sin_dibujar": "q Q"}[kind])
+    doc.save(path)
+    doc.close()
+
+
+def _page_content(doc, page, res, content):
+    doc.xref_set_key(page.xref, "Resources", f"{res} 0 R")
+    c = doc.get_new_xref()
+    doc.update_object(c, "<<>>")
+    doc.update_stream(c, content.encode())
+    doc.xref_set_key(page.xref, "Contents", f"{c} 0 R")
+
+
+def shared_zone(page=0, rect=SHARED_ZONE):
+    return [{"id": f"z{page}", "page": page, "category": "Censura Manual", "text": "Censura Manual",
+             "rect": list(rect)}]
+
+
+def _pil(doc, xref):
+    from PIL import Image
+    pix = fitz.Pixmap(doc, xref)
+    if pix.alpha:
+        pix = fitz.Pixmap(pix, 0)
+    return Image.frombytes({1: "L", 3: "RGB", 4: "CMYK"}[pix.n], (pix.width, pix.height), pix.samples)
+
+
+def original_pixels_in_zones(src, out, items, lossy=False):
+    """Píxeles de las zonas que conservan su valor original, sumados en TODAS las imágenes de la
+    salida del tamaño de la original (y en sus SMask, frente al alfa original). Zona en píxeles:
+    redondeada hacia fuera (todo píxel que toca). Sin pérdida: mismo valor y distinto del borrado
+    (blanco, o sin tinta en CMYK; alfa opaco). Con pérdida: en gris, a 16 o menos de la original,
+    donde la original está a 64 o más del blanco."""
+    import math
+    sdoc, odoc = fitz.open(src), fitz.open(out)
+    zones = {}
+    for it in items:
+        page = sdoc[it["page"]]
+        rotation = page.rotation
+        page.set_rotation(0)
+        z = fitz.Rect(it["rect"])
+        for info in page.get_image_info(xrefs=True):
+            if not z.intersects(fitz.Rect(info["bbox"])):
+                continue
+            inv, w, h = ~fitz.Matrix(info["transform"]), info["width"], info["height"]
+            pts = [fitz.Point(c) * inv for c in (z.tl, z.tr, z.br, z.bl)]
+            xs, ys = [p.x * w for p in pts], [p.y * h for p in pts]
+            e = redact.PIXEL_EPS  # el error de las matrices de MuPDF no cuenta como tocar
+            zones.setdefault(info["xref"], []).append(
+                (max(0, math.floor(min(xs) + e)), max(0, math.floor(min(ys) + e)),
+                 min(w, math.ceil(max(xs) - e)), min(h, math.ceil(max(ys) - e))))
+        page.set_rotation(rotation)
+    total = 0
+    images = [y for y in range(1, odoc.xref_length()) if odoc.xref_get_key(y, "Subtype")[1] == "/Image"]
+    for x, rects in zones.items():
+        originals = [_pil(sdoc, x)]
+        smask = sdoc.xref_get_key(x, "SMask")
+        if smask[0] == "xref":
+            originals.append(_pil(sdoc, int(smask[1].split()[0])))
+        for orig in originals:
+            for y in images:
+                img = _pil(odoc, y)
+                if img.size != orig.size or img.mode != orig.mode:
+                    continue
+                for r in rects:
+                    total += _kept_pixels(orig.crop(r), img.crop(r), lossy)
+    sdoc.close()
+    odoc.close()
+    return total
+
+
+def _kept_pixels(a, b, lossy):
+    from PIL import Image, ImageChops
+    if lossy:
+        ga, gb = a.convert("RGB").convert("L"), b.convert("RGB").convert("L")
+        close = ImageChops.difference(ga, gb).point(lambda v: 255 if v <= 16 else 0)
+        hit = ImageChops.multiply(close, ga.point(lambda v: 255 if v <= 191 else 0))
+    else:
+        erased = Image.new(a.mode, a.size, {"L": 255, "RGB": (255, 255, 255), "CMYK": (0, 0, 0, 0)}[a.mode])
+        same = notw = None
+        for i in range(len(a.getbands())):
+            eq = ImageChops.difference(a, b).getchannel(i).point(lambda v: 255 if v == 0 else 0)
+            ne = ImageChops.difference(a, erased).getchannel(i).point(lambda v: 255 if v else 0)
+            same = eq if same is None else ImageChops.multiply(same, eq)
+            notw = ne if notw is None else ImageChops.lighter(notw, ne)
+        hit = ImageChops.multiply(same, notw)
+    return hit.histogram()[255]
+
+
+def renders(path, pages, dpi=100):
+    doc = fitz.open(path)
+    try:
+        return [doc[n].get_pixmap(dpi=dpi).samples for n in pages]
+    finally:
+        doc.close()
+
+
+def without_contention():
+    """Sin la contención (como antes de la incidencia): para comprobar que la verificación final
+    detecta los restos."""
+    from unittest import mock
+    return [mock.patch.object(redact.HiddenPixels, "after_redaction", lambda self, page, pairs: pairs),
+            mock.patch.object(redact.HiddenPixels, "other_pages", lambda self, *a: None),
+            mock.patch.object(redact.HiddenPixels, "finish", lambda self: self.scratch and self.scratch.close())]
+
+
+class ImagenCompartidaPixelesOcultos(unittest.TestCase):
+    """Incidencia del 2026-10-27 (caso «fondo con recortes»): una zona en una página borraba los
+    píxeles solo en su copia de la imagen; las otras páginas que la comparten, y no muestran esa
+    parte, seguían con la original entera. Ahora cada página recibe su copia sin lo que no
+    muestra, y la verificación final lo comprueba (422 si queda algo)."""
+
+    def apply(self, src, items, contention=True):
+        out = tmp_path(self, "out.pdf")
+        if contention:
+            return redact.apply(src, out, items), out
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in without_contention():
+                stack.enter_context(p)
+            return redact.apply(src, out, items), out
+
+    def check(self, variant, fmt="flate", rotate=0, mask=None, extra=(), same_render=True):
+        src = tmp_path(self, "in.pdf")
+        make_shared_pdf(src, variant, fmt, rotate, mask, extra)
+        items = shared_zone()
+        report, out = self.apply(src, items)
+        self.assertTrue(report["verified"], report)
+        lossy = fmt in ("jpeg", "cmyk", "jpx")
+        self.assertEqual(original_pixels_in_zones(src, out, items, lossy), 0)
+        others = range(1, 3 + len(extra))
+        if same_render:
+            self.assertEqual(renders(src, others), renders(out, others))
+        # Sin la contención quedaban (es la incidencia) y la verificación final lo detecta.
+        report, _ = self.apply(src, items, contention=False)
+        self.assertFalse(report["verified"])
+        self.assertIn("REDACT_HIDDEN_PIXELS", report["leaks"])
+        return src, out
+
+    def test_fondo_con_recortes(self):
+        self.check("recortes")
+
+    def test_recorte_por_clip(self):
+        self.check("clip")
+
+    def test_imagen_en_parte_fuera_de_la_pagina(self):
+        self.check("fuera")
+
+    def test_paginas_con_rotate_90(self):
+        self.check("recortes", rotate=90)
+        self.check("clip", rotate=90)
+
+    def test_imagen_con_mascara(self):
+        self.check("clip", mask="smask")
+
+    def test_lo_censurado_solo_en_el_alfa(self):
+        """Color blanco (como el borrado) y el texto en la SMask: solo la comparación del alfa
+        lo ve."""
+        self.check("clip", mask="alfa")
+
+    def test_imagen_de_1_bit(self):
+        self.check("fuera", fmt="1bit")
+
+    def test_dentro_de_un_form_comun(self):
+        """El Form se copia para cada página que cambia: las demás siguen con el suyo."""
+        self.check("form")
+
+    def test_formatos_con_perdida(self):
+        """JPEG, CMYK y JPEG 2000 9/7: sin restos. Las copias de las páginas sin zona se
+        recomprimen como la original (mismas tablas o misma tasa), así que su render cambia algo
+        (no se comprueba aquí que sea idéntico)."""
+        for fmt in ("jpeg", "cmyk", "jpx"):
+            with self.subTest(fmt=fmt):
+                self.check("clip", fmt, same_render=False)
+
+    def test_pagina_que_muestra_la_zona_y_pagina_que_no_dibuja_la_imagen(self):
+        """Una página que dibuja la imagen entera ve la zona: conserva la original (se ve, como
+        una aparición que el usuario no ha marcado). Una que la tiene en sus recursos sin
+        dibujarla recibe la copia con la zona borrada."""
+        src = tmp_path(self, "in.pdf")
+        make_shared_pdf(src, "clip", extra=("entera", "sin_dibujar"))
+        report, out = self.apply(src, shared_zone())
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(renders(src, range(1, 5)), renders(out, range(1, 5)))
+        doc, sdoc = fitz.open(out), fitz.open(src)
+        original = fitz.Pixmap(sdoc, sdoc[0].get_images()[0][0]).samples
+        used = [[fitz.Pixmap(doc, im[0]).samples == original for im in doc[n].get_images()] for n in range(5)]
+        # La página que no la dibujaba la pierde de sus recursos al limpiar (save(clean=True)).
+        self.assertEqual(used, [[False], [False], [False], [True], []])
+
+    def test_copia_que_no_se_puede_hacer_cierra_en_fallo(self):
+        """Si MuPDF no hace la copia de la página que ve media zona, esa página se queda con la
+        original, que no está entre las copias comprobadas (checked_digests): la verificación
+        final la decodifica y da 422. Con JPEG, donde la verificación se fía de las copias
+        comprobadas."""
+        from unittest import mock
+        src = tmp_path(self, "in.pdf")
+        make_shared_pdf(src, "clip", "jpeg", extra=("mitad",))
+        with mock.patch.object(redact._Scratch, "copy", lambda self, *a: None):
+            report, out = self.apply(src, shared_zone())
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["leaks"], ["REDACT_HIDDEN_PIXELS"])
+        self.assertFalse(os.path.exists(out))
+
+    def test_marca_de_agua_con_transparencia_que_se_ve_entera(self):
+        """Una marca de agua con SMask que todas las páginas muestran entera (Word, Writer,
+        reportlab y Chrome la hacen así): MuPDF la dibuja dentro de su propia máscara
+        (clip_image_mask con la misma matriz), que no es un recorte de la página. Las otras
+        páginas la ven entera: siguen con la original, sin copia, y se ven igual."""
+        src = tmp_path(self, "in.pdf")
+        make_shared_pdf(src, "clip", mask="smask", pages=0, extra=("entera", "entera", "entera"))
+        report, out = self.apply(src, shared_zone())
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(renders(src, (1, 2)), renders(out, (1, 2)))
+        doc, sdoc = fitz.open(out), fitz.open(src)
+        original = fitz.Pixmap(sdoc, sdoc[1].get_images()[0][0]).samples
+        self.assertEqual([fitz.Pixmap(doc, doc[n].get_images()[0][0]).samples == original for n in range(3)],
+                         [False, True, True])
+
+    def test_patron_comun_no_se_puede_copiar_y_cierra_en_fallo(self):
+        """Una imagen dentro de un patrón que usan varias páginas: apply_redactions quita el
+        relleno en la página censurada, pero las otras siguen con el patrón y la imagen entera. La
+        contención no lo sigue: no se censura nada (SHARED_IMAGE_UNSUPPORTED)."""
+        src, out = tmp_path(self, "in.pdf"), None
+        make_shared_pdf(src, "patron")
+        report, out = self.apply(src, shared_zone())
+        self.assertFalse(report["verified"])
+        self.assertEqual(report.get("refused"), "SHARED_IMAGE_UNSUPPORTED")
+        self.assertNotIn("leaks", report)
+        self.assertEqual(report["applied"], 0)
+        self.assertFalse(os.path.exists(out))
+        # En una sola página no hay otra que lo conserve: se censura como siempre.
+        make_shared_pdf(src, "patron", pages=1)
+        report, _ = self.apply(src, shared_zone())
+        self.assertTrue(report["verified"], report)
+
+    def _patron_por_pagina(self, src, pages=3):
+        """Como imprime Chrome un fondo CSS en mosaico cuya pieza mide tres páginas: un patrón
+        PROPIO en cada página, todos con la MISMA imagen, desplazado para que la página i muestre
+        su tercio. get_images no ve la imagen (va dentro de los patrones)."""
+        keys, data, filt = shared_stream("flate")
+        doc = fitz.open()
+        image = doc.get_new_xref()
+        _stream_object(doc, image, f"/Type /XObject /Subtype /Image /Width {SHARED_W} /Height {SHARED_H} {keys}",
+                       data, filt)
+        for i in range(pages):
+            page = doc.new_page(width=595, height=842)
+            pattern = doc.get_new_xref()
+            doc.update_object(pattern, f"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+                                       f"/BBox [0 0 595 2526] /XStep 595 /YStep 2526 "
+                                       f"/Matrix [1 0 0 1 0 {-(2 - i) * 842}] "
+                                       f"/Resources << /XObject << /Fondo {image} 0 R >> >> >>")
+            doc.update_stream(pattern, b"q 595 0 0 2526 0 0 cm /Fondo Do Q")
+            res = doc.get_new_xref()
+            doc.update_object(res, f"<< /Pattern << /P {pattern} 0 R >> >>")
+            _page_content(doc, page, res, "q /Pattern cs /P scn 0 0 595 842 re f Q")
+        doc.save(src)
+        doc.close()
+
+    def test_patron_propio_por_pagina_con_la_misma_imagen_cierra_en_fallo(self):
+        """El caso de Chrome: apply_redactions quita el relleno con patrón en la página censurada,
+        pero las otras conservan la imagen entera y no muestran la zona: quedaban sus píxeles
+        (3.765 de 3.765 con un PDF real de Chrome) y la verificación no los veía. Ahora no se
+        censura nada (SHARED_IMAGE_UNSUPPORTED)."""
+        src = tmp_path(self, "in.pdf")
+        self._patron_por_pagina(src)
+        report, out = self.apply(src, shared_zone())
+        self.assertEqual(report.get("refused"), "SHARED_IMAGE_UNSUPPORTED", report)
+        self.assertFalse(os.path.exists(out))
+        # Con una sola página no hay otra que la conserve: se censura como siempre.
+        self._patron_por_pagina(src, pages=1)
+        report, _ = self.apply(src, shared_zone())
+        self.assertTrue(report["verified"], report)
+
+    def test_la_verificacion_ve_las_imagenes_de_los_patrones(self):
+        """Sin el rechazo previo (simulado), la verificación final encuentra los píxeles de la zona
+        en la imagen de los patrones de las otras páginas: 422."""
+        from unittest import mock
+        src = tmp_path(self, "in.pdf")
+        self._patron_por_pagina(src)
+        real = redact.hidden_pixels_plan
+        with mock.patch.object(redact, "hidden_pixels_plan", lambda doc, zones: (real(doc, zones)[0], False, real(doc, zones)[2])):
+            report, out = self.apply(src, shared_zone())
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["leaks"], ["REDACT_HIDDEN_PIXELS"])
+        self.assertFalse(os.path.exists(out))
+
+    def test_redondeo_hacia_fuera(self):
+        """Un píxel tocado por la zona en 0,0005 px: MuPDF (tolerancia de 0,001 px) lo deja con su
+        valor; se borra igual. Sin ese borrado, la verificación lo detecta."""
+        from PIL import Image
+        img = Image.effect_noise((100, 100), 60).convert("RGB")
+        src = tmp_path(self, "in.pdf")
+        doc = fitz.open()
+        page = doc.new_page(width=100, height=100)
+        x = doc.get_new_xref()
+        _stream_object(doc, x, "/Type /XObject /Subtype /Image /Width 100 /Height 100 /ColorSpace /DeviceRGB "
+                               "/BitsPerComponent 8", zlib.compress(img.tobytes()), "/FlateDecode")
+        res = doc.get_new_xref()
+        doc.update_object(res, f"<< /XObject << /Im {x} 0 R >> >>")
+        _page_content(doc, page, res, "q 100 0 0 100 0 0 cm /Im Do Q")
+        doc.save(src)
+        doc.close()
+        items = shared_zone(rect=[20, 20, 50.0005, 40])
+        report, out = self.apply(src, items)
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(original_pixels_in_zones(src, out, items), 0)
+        out_doc = fitz.open(out)
+        pix = fitz.Pixmap(out_doc, out_doc[0].get_images()[0][0])
+        self.assertEqual(pix.pixel(50, 30), (255, 255, 255))
+        self.assertNotEqual(pix.pixel(51, 30), (255, 255, 255))  # el de al lado no se toca
+        report, _ = self.apply(src, items, contention=False)
+        self.assertEqual(report.get("leaks"), ["REDACT_HIDDEN_PIXELS"])
+
+    def test_imagen_en_linea_en_un_form_comun(self):
+        """Una imagen en línea no se puede copiar por página: si está en un Form que usa otra
+        página y la toca una zona, apply no censura nada (SHARED_IMAGE_UNSUPPORTED)."""
+        src = tmp_path(self, "in.pdf")
+        doc = fitz.open()
+        form = doc.get_new_xref()
+        doc.update_object(form, "<< /Type /XObject /Subtype /Form /BBox [0 0 595 842] >>")
+        doc.update_stream(form, b"q 595 0 0 842 0 0 cm BI /W 4 /H 4 /CS /G /BPC 8 ID "
+                                + bytes(range(0, 256, 16)) + b" EI Q")
+        res = doc.get_new_xref()
+        doc.update_object(res, f"<< /XObject << /Plantilla {form} 0 R >> >>")
+        for i in range(2):
+            page = doc.new_page(width=595, height=842)
+            _page_content(doc, page, res, f"q 0 {562 - i * 280} 595 280 re W n /Plantilla Do Q")
+        doc.save(src)
+        doc.close()
+        report, out = self.apply(src, shared_zone())
+        self.assertFalse(report["verified"])
+        self.assertEqual(report.get("refused"), "SHARED_IMAGE_UNSUPPORTED")
+        self.assertNotIn("leaks", report)
+        self.assertEqual(report["applied"], 0)
+        self.assertFalse(os.path.exists(out))
+
+    def test_aviso_previo_cuenta_las_copias_de_la_contencion(self):
+        """Las copias de las páginas sin zona también cuentan para SHARED_IMAGE_TOO_LARGE: con un
+        límite entre la estimación sin ellas y con ellas, se rechaza en la segunda comprobación."""
+        from unittest import mock
+        src = tmp_path(self, "in.pdf")
+        make_shared_pdf(src, "clip", extra=("mitad", "sin_dibujar"))
+        doc = fitz.open(src)
+        stream = len(doc.xref_stream_raw(doc[0].get_images()[0][0]))
+        doc.close()
+        # Página 1: su copia (la de apply_redactions), que también usan las páginas que no ven
+        # nada de la zona (2, 3 y 5). La 4 ve media zona: una copia más, con la otra mitad.
+        self.assertEqual(redact.contention_copies(*self._plan(src, shared_zone())), {self._image(src): 1})
+        report, out = self.apply(src, shared_zone())
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(renders(src, range(1, 5)), renders(out, range(1, 5)))
+        # La mitad que la página 4 no ve (desde x = 201,5 pt: píxeles enteros fuera de su recorte).
+        self.assertEqual(original_pixels_in_zones(src, out, shared_zone(rect=[201.5, 100, 300, 130])), 0)
+        # Sin las copias de la contención la estimación no pasaría del límite; con ellas, sí.
+        limit = os.path.getsize(src) + int(0.5 * stream)
+        with mock.patch.object(redact, "SHARED_MAX_BYTES", limit):
+            report, out = self.apply(src, shared_zone())
+        self.assertEqual(report.get("refused"), "SHARED_IMAGE_TOO_LARGE", report)
+        self.assertEqual(report["estimate"]["copies"], 1)
+        self.assertFalse(os.path.exists(out))
+
+    def _image(self, src):
+        doc = fitz.open(src)
+        try:
+            return doc[0].get_images()[0][0]
+        finally:
+            doc.close()
+
+    def _plan(self, src, items):
+        doc = fitz.open(src)
+        zones = {}
+        for it in items:
+            zones.setdefault(it["page"], []).append(fitz.Rect(it["rect"]))
+        plan, _, _ = redact.hidden_pixels_plan(doc, zones)
+        return plan, zones
 
 
 if __name__ == "__main__":

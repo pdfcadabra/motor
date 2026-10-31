@@ -105,6 +105,12 @@ Reglas comunes:
 | 3 | El PDF de entrada tiene contraseña de apertura: no se ha procesado. |
 | 4 | Según el comando: `search`, patrones no válidos; `jpeg_flate.py`, no se han podido restaurar las imágenes protegidas; `verify`, la salida no es válida. |
 
+### Variables de entorno
+
+| Variable | Comando | Significado |
+|---|---|---|
+| `MOTOR_MAX_JOBS` | `apply` | Desde la versión 1.2.0. Cuántos trabajos pueden correr a la vez en la misma máquina o contenedor (entero ≥ 1; por defecto, 1). Reparte la memoria entre ellos en el aviso previo `SHARED_IMAGE_TOO_LARGE`. |
+
 ### Coordenadas
 
 Los rectángulos son `[x0, y0, x1, y1]` en puntos (1/72 de pulgada), en el espacio de la
@@ -233,8 +239,49 @@ espacio de `Page.search_for` de PyMuPDF.
   | `success`, `verified` | booleano | `true` si la verificación final no ha encontrado nada. |
   | `applied` | entero | Zonas aplicadas. |
   | `failed` | array | `{id, error}` de cada zona que no se ha podido aplicar (página inexistente, rectángulo no válido o fuera de la página…). |
-  | `leaks` | array de cadenas | Solo si `verified` es `false`: dónde sigue algo. Valores: `content_syntax` (un contenido de página no se puede analizar), `nesting_depth` (un objeto demasiado anidado para limpiarlo), `page_text`, `hidden_text`, `render_not_black`, `form_fields`, `annotations`, `links`, `metadata_info`, `metadata_xmp`, `outline`, `attachments`, `pdf_objects`. Nunca incluye los términos. |
+  | `leaks` | array de cadenas | Solo si `verified` es `false`: dónde sigue algo. Valores: `content_syntax` (un contenido de página no se puede analizar), `nesting_depth` (un objeto demasiado anidado para limpiarlo), `page_text`, `hidden_text`, `render_not_black`, `form_fields`, `annotations`, `links`, `metadata_info`, `metadata_xmp`, `outline`, `attachments`, `pdf_objects`, `REDACT_HIDDEN_PIXELS` (desde la versión 1.2.0: alguna imagen de la salida que viene de una imagen censurada conserva píxeles de una zona con su valor original sin que se vean en ninguna página: ver más abajo). Nunca incluye los términos. |
   | `text_loss_pages` | array de enteros | Solo si `verified` es `true`: páginas (desde 1) que han perdido texto fuera de las zonas censuradas (por ejemplo, un trazo o un relleno con patrón que tocaba una zona). |
+  | `refused` | cadena | Desde la versión 1.2.0. Solo si no se ha censurado nada por un aviso previo (entonces `verified` es `false`, `applied` es 0 y no hay `leaks`). Valores: `SHARED_IMAGE_TOO_LARGE` y `SHARED_IMAGE_UNSUPPORTED` (ver más abajo). |
+  | `estimate` | objeto | Desde la versión 1.2.0. Con `refused`: la estimación que lo ha decidido (`bytes`, `seconds`, `memory`, `copies` y `max_memory`, enteros; `max_memory` es `null` si no se sabe la memoria disponible). |
+
+  Imágenes compartidas entre páginas: una zona borra los píxeles de la imagen en su página
+  (todo píxel que toca, aunque sea en parte). Cada otra página que usa la misma imagen y no
+  muestra entera esa parte (otra CropBox, un recorte, la imagen sale de la página o no la
+  dibuja) recibe su propia copia con los píxeles que no muestra borrados; lo que sí muestra no
+  cambia (en JPEG y JPEG 2000 la copia se recomprime como la original). Lo que otra página
+  muestra de una zona se queda, como cualquier aparición visible que no se ha marcado. La
+  verificación final (`REDACT_HIDDEN_PIXELS`) lo comprueba en cada imagen de la salida.
+
+  `SHARED_IMAGE_UNSUPPORTED`: una zona toca una imagen que no se puede copiar por página: una
+  imagen dibujada desde un patrón de mosaico que usa también otra página (con el mismo patrón o
+  con otro; p. ej. un fondo CSS en mosaico impreso con Chrome, que hace un patrón por página con
+  la misma imagen), o una imagen en línea dentro de un Form XObject común. Censurarla dejaría sus
+  píxeles en las otras páginas: `apply` no censura nada:
+
+  ```json
+  {"success": false, "verified": false, "refused": "SHARED_IMAGE_UNSUPPORTED", "applied": 0, "failed": []}
+  ```
+
+  `SHARED_IMAGE_TOO_LARGE`: antes de censurar, por cada imagen que usan varias páginas
+  (también desde un Form XObject común), cada página con una zona que la toca dejaría su
+  propia copia entera de la imagen, y también cada página sin zona que no muestre entera la
+  de otra (una copia por cada borrado distinto). Si la estimación de esas copias pasa de 150 MB
+  de salida (la entrada más una copia del tamaño del flujo de la imagen por copia), de 180 s o
+  de la memoria máxima de un trabajo (`max_memory`), `apply` no censura nada:
+
+  ```json
+  {"success": false, "verified": false, "refused": "SHARED_IMAGE_TOO_LARGE",
+   "estimate": {"bytes": 222279891, "seconds": 157, "copies": 250, "memory": 1733783150,
+                "max_memory": 1503238553},
+   "applied": 0, "failed": []}
+  ```
+
+  Memoria máxima de un trabajo: el 70 % de la memoria disponible entre los trabajos que pueden
+  correr a la vez. La memoria disponible es el límite del cgroup del proceso
+  (`/sys/fs/cgroup/memory.max` en v2, `/sys/fs/cgroup/memory/memory.limit_in_bytes` en v1: el
+  `mem_limit` del contenedor) o, sin límite, la RAM física; si no se puede saber, ese límite no
+  se aplica. Los trabajos a la vez los dice la variable de entorno `MOTOR_MAX_JOBS` (entero; sin
+  ella o si no es válida, 1).
 
   Regla de uso: entregar `SALIDA` solo si `verified` es `true` y `failed` está vacío. Si
   `failed` no está vacío, lo que debían tapar esas zonas sigue en el documento.
