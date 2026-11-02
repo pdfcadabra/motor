@@ -912,8 +912,110 @@ SCRATCH_MAX_SIDE = 14400
 # Un dibujo de imagen en una página: xrefs, las imágenes que pueden ser (una si se ha
 # identificado; vacío para una imagen en línea); matrix, del cuadrado unidad a la página sin
 # girar; clips, los recortes activos [(subtrazados, par_impar)] en espacio de página, o None si
-# alguno no se puede representar como polígono (entonces la imagen se da por no visible).
-Placement = namedtuple("Placement", "xrefs width height matrix clips")
+# alguno no se puede representar como polígono (entonces la imagen se da por no visible); tile,
+# el relleno con patrón de mosaico (_TileFill) desde el que se dibuja, o None.
+Placement = namedtuple("Placement", "xrefs width height matrix clips tile", defaults=(None,))
+
+
+# Patrones de mosaico (2026-10-31). Con muchas piezas, MuPDF dibuja un relleno con patrón como un
+# mosaico (<tile> en el trazado): el contenido del patrón se ejecuta una sola vez, en la pieza de
+# su origen, que puede estar fuera de lo que cubre el relleno. Las demás piezas no salen en el
+# trazado. Con pocas piezas, las dibuja una a una (sin <tile>) y cada una sale en su sitio, con el
+# recorte del relleno. Por eso, de un <tile> se guarda lo que cubre de verdad (area: su rectángulo
+# en la página sin girar, recortado por los recortes activos que se pueden representar; los demás
+# solo lo reducirían) y cómo se repite, para situar las piezas que toca una zona (_tile_pieces).
+# area None: no se ha podido calcular, y se da por toda la página.
+class _TileFill:
+    __slots__ = ("area", "pattern_area", "ctm", "xstep", "ystep", "nested")
+
+    def __init__(self, area=None, pattern_area=None, ctm=None, xstep=0.0, ystep=0.0):
+        self.area, self.pattern_area, self.ctm = area, pattern_area, ctm
+        self.xstep, self.ystep = xstep, ystep
+        self.nested = False  # con otro patrón de mosaico dentro: las piezas no se calculan
+
+
+# Piezas de un mosaico que se sitúan como mucho para las zonas de una página; con más, la imagen
+# entera cuenta como tocada.
+MAX_TILE_PIECES = 10_000
+
+
+def _finite_rect(r):
+    return all(math.isfinite(v) for v in (r.x0, r.y0, r.x1, r.y1))
+
+
+def _tile_fill(attrs, clips):
+    """El relleno de un <tile> del trazado: atributos (area y view en el espacio del patrón,
+    xstep, ystep y transform, del patrón a la página) y recortes activos."""
+    try:
+        pattern_area = fitz.Rect(*(float(v) for v in attrs["area"].split()))
+        ctm = _trace_matrix(attrs["transform"])
+        xstep, ystep = float(attrs["xstep"]), float(attrs["ystep"])
+    except (KeyError, ValueError, TypeError):
+        return _TileFill()
+    area = pattern_area * ctm
+    if not (_finite_rect(pattern_area) and _finite_rect(area)):
+        return _TileFill()
+    for c in clips:
+        if c is None or c[0] == "mask":
+            continue
+        pts = [pt for sp in c[0] for pt in sp]
+        if not pts:
+            return _TileFill(fitz.Rect(), pattern_area, ctm, xstep, ystep)  # no se ve nada
+        area &= fitz.Rect(min(x for x, _ in pts), min(y for _, y in pts),
+                          max(x for x, _ in pts), max(y for _, y in pts))
+        if area.is_empty:
+            return _TileFill(fitz.Rect(), pattern_area, ctm, xstep, ystep)
+    return _TileFill(area, pattern_area, ctm, xstep, ystep)
+
+
+def _meets(a, b):
+    """¿Comparten área los rectángulos a y b?"""
+    return a.x0 < b.x1 and b.x0 < a.x1 and a.y0 < b.y1 and b.y0 < a.y1
+
+
+def tile_touched(tile, zones):
+    """¿Toca alguna zona lo que cubre el relleno con patrón? Sin área calculada, sí."""
+    if tile.area is None:
+        return bool(zones)
+    return any(_meets(z, tile.area) for z in zones)
+
+
+def _tile_pieces(p, zones):
+    """Dibujos de la imagen p (dibujada dentro del patrón de mosaico p.tile) en cada pieza que
+    toca alguna zona, dentro de lo que cubre el relleno; None si no se pueden calcular (patrón
+    dentro de otro, sin área, paso nulo, matriz que no se invierte o más de MAX_TILE_PIECES)."""
+    t = p.tile
+    if t.nested or t.area is None or t.ctm is None or not t.xstep or not t.ystep:
+        return None
+    m = t.ctm
+    if abs(m.a * m.d - m.b * m.c) < 1e-12:
+        return None
+    inv = ~m
+    local = p.matrix * inv  # del cuadrado unidad al espacio del patrón, en la pieza (0, 0)
+    cell = fitz.Rect(0, 0, 1, 1) * local
+    pieces, count = {}, 0
+    for z in zones:
+        if not _meets(z, t.area):
+            continue
+        zp = (z & t.area) * inv & t.pattern_area
+        if zp.is_empty:
+            continue
+        ranges = []
+        for lo, hi, size, step in ((zp.x0, zp.x1, (cell.x0, cell.x1), t.xstep),
+                                   (zp.y0, zp.y1, (cell.y0, cell.y1), t.ystep)):
+            a, b = sorted(((lo - size[1]) / step, (hi - size[0]) / step))
+            ranges.append(range(math.floor(a), math.ceil(b) + 1))
+        count += len(ranges[0]) * len(ranges[1])
+        if count > MAX_TILE_PIECES:
+            return None
+        for i in ranges[0]:
+            for j in ranges[1]:
+                if (i, j) in pieces:
+                    continue
+                q = local * fitz.Matrix(1, 0, 0, 1, i * t.xstep, j * t.ystep) * m
+                if _meets(z, fitz.Rect(0, 0, 1, 1) * q):
+                    pieces[(i, j)] = Placement(p.xrefs, p.width, p.height, q, None, t)
+    return list(pieces.values())
 
 _TRACE_TAG = re.compile(r"\s*<(/?)([a-z_]+)")
 _TRACE_ATTR = re.compile(r'\b([a-z0-9_]+)="([^"]*)"')
@@ -969,13 +1071,16 @@ def _path_op(path, tag, attrs):
 
 def parse_trace(text):
     """Dibujos de imagen del trazado de una página, en orden: [(es máscara, ancho, alto, matriz,
-    recortes)]. recortes: los activos, [(subtrazados, par_impar)], o None si alguno no se puede
-    representar (texto, trazo, máscara de imagen o suave) o la imagen se dibuja dentro de un
-    patrón o de la definición de una máscara."""
+    recortes, relleno con patrón)]. recortes: los activos, [(subtrazados, par_impar)], o None si
+    alguno no se puede representar (texto, trazo, máscara de imagen o suave) o la imagen se dibuja
+    dentro de un patrón o de la definición de una máscara. relleno con patrón: el _TileFill del
+    <tile> más externo en que se dibuja, o None."""
     draws, stack = [], []
     opaque = 0   # dentro de un patrón (<tile>) o de la definición de una máscara (<clip_mask>)
     skip = None  # etiqueta cuyo contenido se salta
     path = None  # recorte en lectura
+    tiles = 0    # <tile> abiertos
+    tile = None  # el más externo
     for line in text.splitlines():
         m = _TRACE_TAG.match(line)
         if not m:
@@ -999,6 +1104,10 @@ def parse_trace(text):
                 opaque -= 1
                 if tag == "clip_mask":
                     stack.append(None)  # lo que se dibuja con la máscara, hasta su pop_clip
+                elif tiles:
+                    tiles -= 1
+                    if not tiles:
+                        tile = None
             continue
         if tag == "clip_path":
             attrs = dict(_TRACE_ATTR.findall(line))
@@ -1019,6 +1128,12 @@ def parse_trace(text):
         elif tag in ("tile", "clip_mask"):
             if not empty:
                 opaque += 1
+                if tag == "tile":
+                    if tile is None:
+                        tile = _tile_fill(dict(_TRACE_ATTR.findall(line)), stack)
+                    else:
+                        tile.nested = True
+                    tiles += 1
             elif tag == "clip_mask":
                 stack.append(None)
         elif tag in ("fill_image", "fill_image_mask"):
@@ -1029,7 +1144,7 @@ def parse_trace(text):
             active = [c for c in stack if c != own]
             clips = None if opaque or any(c is None or c[0] == "mask" for c in active) else active
             draws.append((tag == "fill_image_mask", int(attrs["width"]), int(attrs["height"]),
-                          _trace_matrix(attrs["transform"]), clips))
+                          _trace_matrix(attrs["transform"]), clips, tile))
     return draws
 
 
@@ -1125,11 +1240,11 @@ def placements(page):
         if any(len(xs) > 1 for xs in candidates.values()) or inline:
             order = _do_order(doc, page)
             if order is not None and (len(order) != len(draws) or any(
-                    x not in candidates.get((w, h, mask), ()) for x, (mask, w, h, _, _) in zip(order, draws))):
+                    x not in candidates.get((w, h, mask), ()) for x, (mask, w, h, *_) in zip(order, draws))):
                 order = None
         digests = by_digest = None
         out = []
-        for i, (mask, w, h, matrix, clips) in enumerate(draws):
+        for i, (mask, w, h, matrix, clips, tile) in enumerate(draws):
             xrefs = candidates.get((w, h, mask), set())
             if order is not None:
                 xrefs = {order[i]}
@@ -1146,7 +1261,7 @@ def placements(page):
                     found = by_digest.get(digests[i], set()) & xrefs
                     if found or inline:
                         xrefs = found  # vacío: una imagen en línea del mismo tamaño
-            out.append(Placement(frozenset(xrefs), w, h, matrix, clips))
+            out.append(Placement(frozenset(xrefs), w, h, matrix, clips, tile))
     return out, visible
 
 
@@ -1315,10 +1430,17 @@ def hidden_pixels_plan(doc, zones_by_page):
     - draws: {página: [Placement]} de cada página que usa la imagen (aunque no la dibuje);
     - visible: {página: rectángulo visible}.
     sin_copia: True si una zona toca una imagen que no se puede copiar por página (en línea en un
-    Form XObject, o dentro de un patrón, que usa otra página): apply no censura. Imágenes por
-    página: {página: {kind: xrefs}}, para hidden_image_pixels.
+    Form XObject, o dentro de un patrón, que usa otra página) o lo que cubre un relleno con un
+    patrón de mosaico cuya imagen se usa en otra parte (shared_tile_image): apply no censura.
+    Imágenes por página: {página: {kind: xrefs}}, para hidden_image_pixels.
+
+    Las imágenes de un mosaico (dibujos con tile) que toca una zona entran en el plan con las
+    piezas que toca la zona (_tile_pieces) o, si no se pueden situar, enteras (whole): la
+    contención no las copia (direct False si ninguna página las usa fuera de un patrón), pero la
+    verificación final las revisa.
     """
     images_by_page = {page.number: page.get_images(full=True) for page in doc}
+    direct = {im[0] for ims in images_by_page.values() for im in ims}
     tiling = _has_tiling_patterns(doc)
     pages_using, kinds, in_patterns = {}, {}, {}
     for page in doc:
@@ -1331,6 +1453,7 @@ def hidden_pixels_plan(doc, zones_by_page):
         if tiling:
             for x in pattern_images(doc, page):
                 in_patterns.setdefault(x, set()).add(n)
+    owners = _pattern_owners(doc) if tiling else {}
     traced = {}
 
     def page_placements(n):
@@ -1338,26 +1461,50 @@ def hidden_pixels_plan(doc, zones_by_page):
             traced[n] = placements(doc[n])
         return traced[n]
 
+    def add(x, n, p, whole=False):
+        entry = plan.setdefault(x, {"size": (p.width, p.height), "zone_draws": [], "direct": x in direct,
+                                    "kind": (p.width, p.height, doc.xref_get_key(x, "ImageMask")[1] == "true")})
+        entry["whole"] = entry.get("whole", False) or whole
+        if not whole:
+            entry["zone_draws"].append((n, p))
+
     plan, unsupported, holders = {}, False, {}
     for n, zones in zones_by_page.items():
         if not zones or not (images_by_page.get(n) or _may_have_inline_images(doc, doc[n])
                              or _page_forms(doc, doc[n], patterns=True)):
             continue
-        for p in page_placements(n)[0]:
+        ps = page_placements(n)[0]
+        for p in ps:
+            if p.tile is not None:
+                continue
             bbox = _placement_bbox(p)
             if not any(z.intersects(bbox) for z in zones):
                 continue
             if not p.xrefs:  # imagen en línea
                 unsupported = unsupported or _inline_in_shared_form(doc, n, holders)
             for x in p.xrefs:
-                entry = plan.setdefault(x, {"size": (p.width, p.height), "zone_draws": [],
-                                            "kind": (p.width, p.height, doc.xref_get_key(x, "ImageMask")[1] == "true")})
-                entry["zone_draws"].append((n, p))
+                add(x, n, p)
+        # Rellenos con patrón de mosaico: cuenta lo que cubre el relleno, no la pieza que da el
+        # trazado (con la zona en otra pieza, antes se censuraba sin mirar la imagen del patrón).
+        for p in ps:
+            if p.tile is None or not tile_touched(p.tile, zones):
+                continue
+            if not p.xrefs:  # en línea, o sin identificar entre las de los patrones de la página
+                unsupported = unsupported or _unknown_in_tile(doc, n, ps, holders)
+                continue
+            pieces = _tile_pieces(p, zones)
+            for x in p.xrefs:
+                unsupported = unsupported or shared_tile_image(x, n, ps, pages_using, owners)
+                if pieces is None:
+                    add(x, n, p, whole=True)
+                for q in pieces or ():
+                    add(x, n, q)
     # La contención no puede copiar por página una imagen dibujada desde un patrón: si la usa más
-    # de una página, censurarla podría dejar sus píxeles ocultos en las otras (comprobado con un
-    # fondo CSS en mosaico de Chrome cuya pieza mide tres páginas). Cierra en fallo.
+    # de una página u otro patrón, censurarla podría dejar sus píxeles ocultos en las otras
+    # (comprobado con un fondo CSS en mosaico de Chrome cuya pieza mide tres páginas). Cierra en
+    # fallo.
     for x in plan:
-        if x in in_patterns and len(pages_using[x]) > 1:
+        if x in in_patterns and (len(pages_using[x]) > 1 or len(owners.get(x, ())) > 1):
             unsupported = True
     for x, entry in list(plan.items()):
         box = None
@@ -1366,6 +1513,8 @@ def hidden_pixels_plan(doc, zones_by_page):
             if t:
                 box = t if box is None else (min(box[0], t[0]), min(box[1], t[1]),
                                              max(box[2], t[2]), max(box[3], t[3]))
+        if entry["whole"]:
+            box = (0, 0) + entry["size"]
         if box is None:
             del plan[x]
             continue
@@ -1376,6 +1525,54 @@ def hidden_pixels_plan(doc, zones_by_page):
             entry["draws"][n] = [p for p in ps if p.xrefs == {x}]
             entry["visible"][n] = visible
     return plan, unsupported, kinds
+
+
+def _pattern_owners(doc):
+    """{imagen: patrones de mosaico que la dibujan desde sus recursos o los de sus Form XObjects}
+    (no desde otro patrón que tengan dentro: ese cuenta como su dueño)."""
+    out = {}
+    for x in range(1, doc.xref_length()):
+        if not _is_tiling(doc, x):
+            continue
+        seen, todo = set(), [x]
+        while todo:
+            h = todo.pop()
+            if h in seen:
+                continue
+            seen.add(h)
+            for r in _xobject_refs(doc, h, "Resources").values():
+                subtype = doc.xref_get_key(r, "Subtype")[1]
+                if subtype == "/Image":
+                    out.setdefault(r, set()).add(x)
+                elif subtype == "/Form":
+                    todo.append(r)
+    return out
+
+
+def shared_tile_image(x, number, ps, pages_using, owners):
+    """¿Se usa en otra parte la imagen x de un relleno con patrón de mosaico de la página? Sí si
+    la usa otra página u otro patrón, otro relleno con patrón de esta página o un dibujo fuera de
+    un patrón (ps: los de la página): apply_redactions quita entero el relleno que toca una zona,
+    pero no la imagen de esos sitios, y lo que ven de ella las piezas de un mosaico no se calcula."""
+    if len(pages_using.get(x, ())) > 1 or len(owners.get(x, ())) > 1:
+        return True
+    tiles = {id(q.tile) for q in ps if x in q.xrefs and q.tile is not None}
+    return len(tiles) > 1 or any(x in q.xrefs and q.tile is None for q in ps)
+
+
+def _inline_in_patterns(doc, page):
+    return any(_INLINE_IMAGE.search(doc.xref_stream(x) or b"") for x in _page_forms(doc, page, patterns=True))
+
+
+def _unknown_in_tile(doc, number, ps, holders):
+    """Una zona toca un relleno con patrón de mosaico que dibuja una imagen sin identificar: ¿hay
+    que rechazar? Sí si no es una imagen en línea (no se sabe cuál es), si el patrón o Form que la
+    lleva lo usa otra página (_inline_in_shared_form) o si la página tiene más de un relleno así
+    (el que no toca la zona la conservaría)."""
+    if not _inline_in_patterns(doc, doc[number]):
+        return True
+    tiles = {id(q.tile) for q in ps if q.tile is not None and not q.xrefs}
+    return len(tiles) > 1 or _inline_in_shared_form(doc, number, holders)
 
 
 def _is_tiling(doc, xref):
@@ -1438,8 +1635,11 @@ def _inline_in_shared_form(doc, number, holders_by_page):
 
 
 def zone_mask(entry, zones_by_page):
-    """Píxeles de la imagen que tocan las zonas (en todas las páginas), en entry["box"]."""
+    """Píxeles de la imagen que tocan las zonas (en todas las páginas), en entry["box"]. Con
+    whole (piezas de un mosaico que no se han podido situar), todos."""
     box = entry["box"]
+    if entry.get("whole"):
+        return _new_mask(box, 1)
     mask = _new_mask(box)
     for n, p in entry["zone_draws"]:
         _draw_zones(mask, box, p, zones_by_page[n])
@@ -1471,9 +1671,12 @@ def contention_copies(plan, zones_by_page):
     """Copias que hará la contención (además de las de apply_redactions), para el aviso previo:
     {xref: número}. Una por cada borrado distinto en las páginas en que apply_redactions no hace
     copia y se ve parte de las zonas; y una con todas las zonas borradas para las que no ven
-    ninguna, salvo que la deje alguna página censurada."""
+    ninguna, salvo que la deje alguna página censurada. Las imágenes que solo se dibujan desde
+    patrones no se copian."""
     out = {}
     for x, entry in plan.items():
+        if not entry.get("direct", True):
+            continue
         zp = zone_mask(entry, zones_by_page)
         partial, full_needed, full_done = [], False, False
         for n in entry["draws"]:
@@ -1719,7 +1922,8 @@ class HiddenPixels:
 
     def __init__(self, doc, plan, zones_by_page):
         self.doc, self.plan, self.zones = doc, plan, zones_by_page
-        self.scratch = _Scratch(doc) if plan else None
+        # Las imágenes que solo se dibujan desde patrones no se copian (direct False).
+        self.scratch = _Scratch(doc) if any(e.get("direct", True) for e in plan.values()) else None
         self.cache = {}      # xref -> [(máscara de borrado, copia)]
         self.full = {}       # xref -> copia con todos los píxeles de las zonas borrados
         self.deferred = {}   # xref -> páginas que no muestran nada de las zonas

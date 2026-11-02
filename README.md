@@ -250,13 +250,19 @@ espacio de `Page.search_for` de PyMuPDF.
   dibuja) recibe su propia copia con los píxeles que no muestra borrados; lo que sí muestra no
   cambia (en JPEG y JPEG 2000 la copia se recomprime como la original). Lo que otra página
   muestra de una zona se queda, como cualquier aparición visible que no se ha marcado. La
-  verificación final (`REDACT_HIDDEN_PIXELS`) lo comprueba en cada imagen de la salida.
+  verificación final (`REDACT_HIDDEN_PIXELS`) lo comprueba en cada imagen de la salida. Desde
+  la versión 1.2.1 también en las imágenes de los patrones de mosaico, con los píxeles de cada
+  pieza que toca una zona (lo que se dibuja desde un mosaico cuenta como no visto).
 
   `SHARED_IMAGE_UNSUPPORTED`: una zona toca una imagen que no se puede copiar por página: una
   imagen dibujada desde un patrón de mosaico que usa también otra página (con el mismo patrón o
   con otro; p. ej. un fondo CSS en mosaico impreso con Chrome, que hace un patrón por página con
   la misma imagen), o una imagen en línea dentro de un Form XObject común. Censurarla dejaría sus
-  píxeles en las otras páginas: `apply` no censura nada:
+  píxeles en las otras páginas. Desde la versión 1.2.1, en un relleno con patrón de mosaico
+  cuenta todo lo que cubre el relleno, en cualquier pieza (antes, solo la primera), y también
+  rechaza si la imagen del patrón está en otro patrón, en otro relleno con patrón de la misma
+  página o dibujada fuera de un patrón en esa página; si no se puede calcular lo que cubre el
+  relleno, se rechaza igual. `apply` no censura nada:
 
   ```json
   {"success": false, "verified": false, "refused": "SHARED_IMAGE_UNSUPPORTED", "applied": 0, "failed": []}

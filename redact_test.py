@@ -1875,5 +1875,232 @@ class ImagenCompartidaPixelesOcultos(unittest.TestCase):
         return plan, zones
 
 
+MOSAIC_PX = 100  # lado de la imagen del mosaico, en píxeles (2 px por pt con piezas de 50 pt)
+
+
+def make_mosaic_pdf(path, pages=3, fills=("q /Pattern cs /P scn 0 0 595 842 re f Q",), own_pattern=True,
+                    nested=False):
+    """Como imprime Chrome un fondo CSS en mosaico: en cada página, un patrón de mosaico PROPIO
+    (own_pattern; si no, uno común) con la MISMA imagen, en piezas de 50 pt, con la pieza (0, 0)
+    arriba a la izquierda. Con más de 200 piezas por página, MuPDF lo dibuja como mosaico (<tile>)
+    y su trazado solo da esa pieza. fills: los rellenos de cada página (/P es el patrón; /P2, otro
+    patrón con la misma imagen). nested: el patrón de la página dibuja otro con la imagen."""
+    from PIL import Image
+    img = Image.effect_noise((MOSAIC_PX, MOSAIC_PX), 60).convert("RGB")
+    doc = fitz.open()
+    image = doc.get_new_xref()
+    _stream_object(doc, image, f"/Type /XObject /Subtype /Image /Width {MOSAIC_PX} /Height {MOSAIC_PX} "
+                               "/ColorSpace /DeviceRGB /BitsPerComponent 8", zlib.compress(img.tobytes()),
+                   "/FlateDecode")
+
+    def pattern(matrix="1 0 0 1 0 792"):
+        x = doc.get_new_xref()
+        doc.update_object(x, f"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 50] "
+                             f"/XStep 50 /YStep 50 /Matrix [{matrix}] /Resources << /XObject << /I {image} 0 R >> >> >>")
+        doc.update_stream(x, b"q 50 0 0 50 0 0 cm /I Do Q")
+        if nested:
+            outer = doc.get_new_xref()
+            doc.update_object(outer, f"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+                                     f"/BBox [0 0 100 100] /XStep 100 /YStep 100 /Resources << /Pattern << /Q {x} 0 R >> >> >>")
+            doc.update_stream(outer, b"q /Pattern cs /Q scn 0 0 100 100 re f Q")
+            x = outer
+        return x
+
+    two = any("/P2 " in f for f in fills)
+    common = None if own_pattern else (pattern(), two and pattern())
+    for _ in range(pages):
+        page = doc.new_page(width=595, height=842)
+        p, p2 = common or (pattern(), two and pattern())
+        res = doc.get_new_xref()
+        doc.update_object(res, f"<< /Pattern << /P {p} 0 R {f'/P2 {p2} 0 R' if p2 else ''} >> >>")
+        _page_content(doc, page, res, " ".join(fills))
+    doc.save(path)
+    doc.close()
+
+
+def first_piece(path, page=0):
+    """Rectángulo de la pieza que da el trazado de MuPDF (la única que veía la contención) y si el
+    patrón se dibuja como mosaico (<tile>)."""
+    doc = fitz.open(path)
+    try:
+        ps, _ = redact.placements(doc[page])
+        return redact._placement_bbox(ps[0]), ps[0].tile is not None
+    finally:
+        doc.close()
+
+
+def without_unsupported():
+    """Sin el rechazo previo SHARED_IMAGE_UNSUPPORTED: para comprobar la verificación final."""
+    from unittest import mock
+    real = redact.hidden_pixels_plan
+    return mock.patch.object(redact, "hidden_pixels_plan", lambda doc, zones: (lambda r: (r[0], False, r[2]))(real(doc, zones)))
+
+
+# Zonas de 120 × 20 pt en piezas que no son la primera (la de arriba a la izquierda), en las tres
+# páginas: en una pieza, entre dos, entre cuatro y en la última fila.
+MOSAIC_ZONES = [(0, (240, 400)), (1, (240, 400)), (2, (450, 780)), (0, (300, 90)), (1, (60, 700)), (2, (420, 815))]
+
+
+def mosaic_zone(page, x, y):
+    return shared_zone(page, [x, y, x + 120, y + 20])
+
+
+class PatronDeMosaico(unittest.TestCase):
+    """Fase 2 del estudio de imagen compartida (2026-10-30): el trazado de MuPDF solo da la primera
+    pieza de un patrón de mosaico. SHARED_IMAGE_UNSUPPORTED solo saltaba si la zona tocaba esa
+    pieza; en otra, se censuraba sin mirar la imagen del patrón en las demás páginas, y la
+    verificación final tampoco. Ahora cuenta lo que cubre el relleno, y la verificación revisa las
+    piezas que toca la zona."""
+
+    def apply(self, src, items):
+        out = tmp_path(self, "out.pdf")
+        return redact.apply(src, out, items), out
+
+    def assert_refused(self, src, items):
+        report, out = self.apply(src, items)
+        self.assertEqual(report.get("refused"), "SHARED_IMAGE_UNSUPPORTED", report)
+        self.assertEqual(report["applied"], 0)
+        self.assertNotIn("leaks", report)
+        self.assertFalse(os.path.exists(out))
+
+    def test_zona_fuera_de_la_primera_pieza(self):
+        src = tmp_path(self, "in.pdf")
+        for own in (True, False):  # un patrón por página, como Chrome, o uno común
+            make_mosaic_pdf(src, own_pattern=own)
+            piece, tiled = first_piece(src)
+            self.assertTrue(tiled)
+            for page, (x, y) in MOSAIC_ZONES:
+                with self.subTest(own=own, page=page, x=x, y=y):
+                    items = mosaic_zone(page, x, y)
+                    self.assertFalse(fitz.Rect(items[0]["rect"]).intersects(piece))
+                    self.assert_refused(src, items)
+
+    def test_la_verificacion_revisa_las_piezas_del_mosaico(self):
+        """Sin el rechazo previo, la verificación final encuentra los píxeles de la zona en la imagen
+        de los patrones de las otras páginas (lo que se dibuja desde un mosaico cuenta como no
+        visto): 422."""
+        src = tmp_path(self, "in.pdf")
+        make_mosaic_pdf(src)
+        for page, (x, y) in MOSAIC_ZONES[:3]:
+            with self.subTest(page=page, x=x, y=y), without_unsupported():
+                report, out = self.apply(src, mosaic_zone(page, x, y))
+                self.assertEqual(report.get("leaks"), ["REDACT_HIDDEN_PIXELS"], report)
+                self.assertFalse(os.path.exists(out))
+
+    def test_piezas_que_toca_la_zona(self):
+        """La zona [140, 210, 160, 230] cae entre las piezas de las columnas 2 y 3 de la fila 4 (de
+        50 pt, 2 px por pt): columnas 80-100 de una y 0-20 de la otra, filas 20-60."""
+        from PIL import ImageChops
+        src = tmp_path(self, "in.pdf")
+        make_mosaic_pdf(src, pages=1)
+        zones = {0: [fitz.Rect(140, 210, 160, 230)]}
+        with fitz.open(src) as doc:
+            plan, unsupported, _ = redact.hidden_pixels_plan(doc, zones)
+        self.assertFalse(unsupported)
+        (entry,) = plan.values()
+        self.assertFalse(entry["whole"])
+        self.assertFalse(entry["direct"])
+        self.assertEqual(entry["box"], (0, 20, 100, 60))
+        expected = redact._new_mask(entry["box"])
+        redact.ImageDraw.Draw(expected).rectangle((0, 0, 19, 39), fill=1)
+        redact.ImageDraw.Draw(expected).rectangle((80, 0, 99, 39), fill=1)
+        self.assertIsNone(ImageChops.logical_xor(redact.zone_mask(entry, zones), expected).getbbox())
+
+    def test_una_pagina_y_un_relleno_se_censura(self):
+        """Sin otra página, otro patrón ni otro relleno con la imagen, apply_redactions quita el
+        relleno que toca la zona y la imagen desaparece: se censura como siempre."""
+        src = tmp_path(self, "in.pdf")
+        make_mosaic_pdf(src, pages=1)
+        for _, (x, y) in MOSAIC_ZONES[:3]:
+            report, out = self.apply(src, mosaic_zone(0, x, y))
+            self.assertTrue(report["verified"], report)
+
+    def test_otro_relleno_u_otro_patron_con_la_imagen_en_la_pagina(self):
+        """El relleno que no toca la zona conservaría la imagen: rechazo previo, también con una
+        sola página."""
+        src = tmp_path(self, "in.pdf")
+        top, bottom = "0 421 595 421 re f", "0 0 595 421 re f"
+        for fills in ([f"q /Pattern cs /P scn {top} Q", f"q /Pattern cs /P scn {bottom} Q"],
+                      [f"q /Pattern cs /P scn {top} Q", f"q /Pattern cs /P2 scn {bottom} Q"]):
+            with self.subTest(fills=fills):
+                make_mosaic_pdf(src, pages=1, fills=fills)
+                self.assert_refused(src, mosaic_zone(0, 240, 600))
+
+    def test_zona_fuera_del_relleno(self):
+        """Solo cuenta lo que cubre el relleno (aquí, la mitad de arriba de cada página): una zona en
+        la de abajo no lo toca y se censura."""
+        src = tmp_path(self, "in.pdf")
+        make_mosaic_pdf(src, fills=("q /Pattern cs /P scn 0 421 595 421 re f Q",))
+        report, _ = self.apply(src, mosaic_zone(1, 240, 600))
+        self.assertTrue(report["verified"], report)
+        self.assert_refused(src, mosaic_zone(1, 240, 400))
+
+    def test_patron_dentro_de_otro(self):
+        """Las piezas de un mosaico dentro de otro no se sitúan: la imagen entera cuenta como
+        tocada, y con varias páginas, rechazo previo."""
+        src = tmp_path(self, "in.pdf")
+        make_mosaic_pdf(src, nested=True)
+        zones = {0: [fitz.Rect(240, 400, 360, 420)]}
+        with fitz.open(src) as doc:
+            plan, unsupported, _ = redact.hidden_pixels_plan(doc, zones)
+        self.assertTrue(unsupported)
+        (entry,) = plan.values()
+        self.assertTrue(entry["whole"])
+        self.assertEqual(entry["box"], (0, 0, MOSAIC_PX, MOSAIC_PX))
+        self.assert_refused(src, mosaic_zone(0, 240, 400))
+
+    def test_area_sin_calcular_cuenta_como_toda_la_pagina(self):
+        """Si el trazado no da el área del relleno (o no se entiende), cualquier zona la toca."""
+        self.assertEqual(redact._tile_fill({"area": "0 0 x 1"}, []).area, None)
+        self.assertTrue(redact.tile_touched(redact._TileFill(), [fitz.Rect(1, 1, 2, 2)]))
+        src = tmp_path(self, "in.pdf")
+        make_mosaic_pdf(src, fills=("q /Pattern cs /P scn 0 421 595 421 re f Q",))
+        from unittest import mock
+        with mock.patch.object(redact, "_tile_fill", lambda attrs, clips: redact._TileFill()):
+            self.assert_refused(src, mosaic_zone(1, 240, 600))
+
+
+# PDF de Chrome del estudio (generados con productores/gen_chrome.js y gen_chrome_mosaicos.js de
+# scripts/estudio-anonimizar-tamano/; ver pruebas-pdf/chrome/README.md). No van con el motor solo.
+CHROME_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pruebas-pdf", "chrome")
+# Mosaicos de 70 × 99 mm (chrome_fondo_pagina), 20 y 10 mm (los tres, <tile> en el trazado) y
+# pieza de página y media (MuPDF dibuja cada pieza: la primera ya cubre la página).
+CHROME_MOSAICS = {"chrome_fondo_pagina": True, "chrome_mosaico_20mm": True, "chrome_mosaico_10mm": True,
+                  "chrome_mosaico_pagina_y_media": False}
+
+
+@unittest.skipUnless(os.path.isdir(CHROME_DIR), "sin pruebas-pdf/chrome (motor solo)")
+class MosaicosDeChrome(unittest.TestCase):
+    """Fondos CSS en mosaico impresos por Chrome (un patrón propio por página con la misma imagen):
+    una zona en cualquier pieza da 422 SHARED_IMAGE_UNSUPPORTED; antes, solo en la primera."""
+
+    def test_zona_en_cualquier_pieza(self):
+        for name, tiled in CHROME_MOSAICS.items():
+            src = os.path.join(CHROME_DIR, name + ".pdf")
+            piece, is_tile = first_piece(src)
+            self.assertEqual(is_tile, tiled, name)
+            for page, (x, y) in MOSAIC_ZONES:
+                with self.subTest(pdf=name, page=page, x=x, y=y):
+                    items = mosaic_zone(page, x, y)
+                    if tiled:
+                        self.assertFalse(fitz.Rect(items[0]["rect"]).intersects(piece))
+                    out = tmp_path(self, "out.pdf")
+                    report = redact.apply(src, out, items)
+                    self.assertEqual(report.get("refused"), "SHARED_IMAGE_UNSUPPORTED", report)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_la_verificacion_revisa_las_piezas_del_mosaico(self):
+        for name, tiled in CHROME_MOSAICS.items():
+            if not tiled:
+                continue  # las otras páginas muestran lo que tapa la zona: no hay restos
+            src = os.path.join(CHROME_DIR, name + ".pdf")
+            for page, (x, y) in MOSAIC_ZONES[:3]:
+                with self.subTest(pdf=name, page=page, x=x, y=y), without_unsupported():
+                    out = tmp_path(self, "out.pdf")
+                    report = redact.apply(src, out, mosaic_zone(page, x, y))
+                    self.assertEqual(report.get("leaks"), ["REDACT_HIDDEN_PIXELS"], report)
+                    self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()
