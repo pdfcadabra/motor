@@ -1,8 +1,9 @@
 # Motor PDFcadabra
 
 Motor de procesado de PDF de [PDFcadabra](https://pdfcadabra.com): anonimiza documentos de
-forma irreversible y protege las imágenes que no admiten pérdida (códigos de barras, QR,
-sellos) al comprimir con un compresor externo. Está escrito en Python sobre
+forma irreversible, protege las imágenes que no admiten pérdida (códigos de barras, QR,
+sellos) al comprimir con un compresor externo y comprime sin pérdida por su cuenta (sin tocar
+ninguna imagen). Está escrito en Python sobre
 [PyMuPDF](https://pypi.org/project/PyMuPDF/1.28.2/) y se usa por línea de comandos.
 
 - Versión: la del archivo [`VERSION`](VERSION).
@@ -19,6 +20,9 @@ sellos) al comprimir con un compresor externo. Está escrito en Python sobre
 | `lossless_images.py` | `protect` | Antes de comprimir, sustituye las imágenes que no deben perder calidad (1 bit, paletas de hasta 16 colores, imágenes de 8 bits sin JPEG con hasta 16 colores) por un marcador diminuto. |
 | `jpeg_flate.py` | (restore) | Después de comprimir, vuelve a poner las imágenes originales en lugar de sus marcadores y envuelve en Flate los JPEG cuando así ocupan menos (sin pérdida). |
 | `pdf_check.py` | `verify` | Comprueba que un resultado se abre, tiene las mismas páginas que la entrada y no ha dejado vacía ninguna página con contenido. |
+| `pdf_check.py` | `info` | Dice si el PDF lleva una firma electrónica y si declara PDF/A. |
+| `lossless_clean.py` | (limpieza) | Comprime sin pérdida: capa Flate en los JPEG, subconjunto de las fuentes TrueType completas, objetos sin usar y repetidos fuera, Flate y flujos de objetos. No recodifica ni reduce ninguna imagen ni toca el contenido de las páginas. Respeta PDF/A. |
+| `perfil.py` | (perfil) | Reparte el peso del PDF (imágenes protegidas, JPEG, otras imágenes, fuentes) y da el motivo por el que no se puede comprimir más. |
 
 Cada comando es un proceso independiente: no usa la red, no guarda estado entre
 ejecuciones y solo lee y escribe las rutas que recibe como argumentos.
@@ -49,7 +53,7 @@ Tests:
 
 ```bash
 pip install -r requirements-test.txt
-python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py pdf_check_test.py
+python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py
 ```
 
 Las pruebas que comprimen de verdad necesitan Ghostscript. Las de la clase
@@ -94,6 +98,14 @@ Reglas comunes:
 - Los PDF con contraseña de apertura no se procesan (código 3). Los que solo tienen
   contraseña de propietario se abren con la contraseña vacía y se procesan; la salida va
   sin cifrar.
+- Firma electrónica (desde la versión 1.3.0): un PDF «firmado» es uno con algún diccionario
+  de firma aplicado, es decir, con `/ByteRange` y `/Contents` (también el `/V` directo de un
+  campo `/FT /Sig`, y los sellos de tiempo de documento, `/DocTimeStamp`). Un campo de firma
+  vacío no cuenta. Solo se detecta y se informa: cualquier salida que no sea la entrada tal
+  cual invalida la firma.
+- PDF/A (desde la versión 1.3.0): un PDF «PDF/A» es uno cuyo XMP del catálogo declara
+  `pdfaid:part` (espacio de nombres `http://www.aiim.org/pdfa/ns/id/`, con cualquier prefijo,
+  como atributo o como elemento). Se lee lo que declara: no se valida la conformidad.
 
 ### Códigos de salida
 
@@ -101,7 +113,7 @@ Reglas comunes:
 |---|---|
 | 0 | Correcto. En `apply`, el informe dice si la censura se ha verificado. |
 | 1 | Error inesperado (por ejemplo, un PDF que no se puede abrir). |
-| 2 | Argumentos incorrectos (`protect`, `jpeg_flate.py` y `verify`). |
+| 2 | Argumentos incorrectos (`protect`, `jpeg_flate.py`, `verify`, `info`, `lossless_clean.py` y `perfil.py`). |
 | 3 | El PDF de entrada tiene contraseña de apertura: no se ha procesado. |
 | 4 | Según el comando: `search`, patrones no válidos; `jpeg_flate.py`, no se han podido restaurar las imágenes protegidas; `verify`, la salida no es válida. |
 
@@ -194,6 +206,9 @@ espacio de `Page.search_for` de PyMuPDF.
   | `group` | cadena | Desde la versión 1.1.0. Identificador del dato, único dentro de `RESULTADOS`: los hallazgos de un detector que son partes de un mismo dato partido (uno por línea, o por trozo de línea si hay un hueco grande en medio) comparten `group`; un dato sin partir, y cada hallazgo de `PATRONES`, tienen el suyo. No dice nada fuera de la respuesta en que viene. |
   | `propagated` | booleano | Desde la versión 1.1.0, opcional: solo aparece, con `true`, en las otras apariciones de un valor que ha encontrado un detector (ver `--detectores`). |
 
+  Además, desde la versión 1.3.0, `"signed": true` junto a `results` y `errors` si la
+  entrada lleva una firma electrónica (ver Reglas comunes); sin firma, el campo no aparece.
+
   Cada aparición da un hallazgo, sin duplicados (mismo texto en el mismo sitio). Una
   expresión que no compila no detiene la búsqueda: va a `errors` con su categoría.
 
@@ -239,10 +254,11 @@ espacio de `Page.search_for` de PyMuPDF.
   | `success`, `verified` | booleano | `true` si la verificación final no ha encontrado nada. |
   | `applied` | entero | Zonas aplicadas. |
   | `failed` | array | `{id, error}` de cada zona que no se ha podido aplicar (página inexistente, rectángulo no válido o fuera de la página…). |
-  | `leaks` | array de cadenas | Solo si `verified` es `false`: dónde sigue algo. Valores: `content_syntax` (un contenido de página no se puede analizar), `nesting_depth` (un objeto demasiado anidado para limpiarlo), `page_text`, `hidden_text`, `render_not_black`, `form_fields`, `annotations`, `links`, `metadata_info`, `metadata_xmp`, `outline`, `attachments`, `pdf_objects`, `REDACT_HIDDEN_PIXELS` (desde la versión 1.2.0: alguna imagen de la salida que viene de una imagen censurada conserva píxeles de una zona con su valor original sin que se vean en ninguna página: ver más abajo). Nunca incluye los términos. |
+  | `leaks` | array de cadenas | Solo si `verified` es `false`: dónde sigue algo. Valores: `content_syntax` (un contenido de página no se puede analizar), `nesting_depth` (un objeto demasiado anidado para limpiarlo), `page_text`, `hidden_text`, `render_not_black`, `form_fields`, `annotations`, `links`, `metadata_info`, `metadata_xmp`, `outline`, `attachments`, `pdf_objects`, `REDACT_HIDDEN_PIXELS` (desde la versión 1.2.0: alguna imagen de la salida que viene de una imagen censurada conserva píxeles de una zona con su valor original sin que se vean en ninguna página o, desde la 1.3.1, bajo una zona: ver más abajo). Nunca incluye los términos. |
   | `text_loss_pages` | array de enteros | Solo si `verified` es `true`: páginas (desde 1) que han perdido texto fuera de las zonas censuradas (por ejemplo, un trazo o un relleno con patrón que tocaba una zona). |
-  | `refused` | cadena | Desde la versión 1.2.0. Solo si no se ha censurado nada por un aviso previo (entonces `verified` es `false`, `applied` es 0 y no hay `leaks`). Valores: `SHARED_IMAGE_TOO_LARGE` y `SHARED_IMAGE_UNSUPPORTED` (ver más abajo). |
-  | `estimate` | objeto | Desde la versión 1.2.0. Con `refused`: la estimación que lo ha decidido (`bytes`, `seconds`, `memory`, `copies` y `max_memory`, enteros; `max_memory` es `null` si no se sabe la memoria disponible). |
+  | `refused` | cadena | Desde la versión 1.2.0. Solo si no se ha censurado nada por un aviso previo (entonces `verified` es `false`, `applied` es 0 y no hay `leaks`). Valores: `SHARED_IMAGE_TOO_LARGE` y `SHARED_IMAGE_UNSUPPORTED` y, desde la versión 1.3.1, `REDACT_TOO_HEAVY` (ver más abajo). |
+  | `estimate` | objeto | Desde la versión 1.2.0. Con `refused`: la estimación que lo ha decidido. Con `SHARED_IMAGE_TOO_LARGE`: `bytes`, `seconds`, `memory`, `copies` y `max_memory` (enteros; `max_memory` es `null` si no se sabe la memoria disponible). Con `REDACT_TOO_HEAVY`: `seconds` y `megapixels` (números) e `images` (entero), contados hasta pasar del límite. |
+  | `signed` | booleano | Desde la versión 1.3.0, opcional: solo aparece, con `true`, si la entrada lleva una firma electrónica (la censura la invalida). |
 
   Imágenes compartidas entre páginas: una zona borra los píxeles de la imagen en su página
   (todo píxel que toca, aunque sea en parte). Cada otra página que usa la misma imagen y no
@@ -252,7 +268,22 @@ espacio de `Page.search_for` de PyMuPDF.
   muestra de una zona se queda, como cualquier aparición visible que no se ha marcado. La
   verificación final (`REDACT_HIDDEN_PIXELS`) lo comprueba en cada imagen de la salida. Desde
   la versión 1.2.1 también en las imágenes de los patrones de mosaico, con los píxeles de cada
-  pieza que toca una zona (lo que se dibuja desde un mosaico cuenta como no visto).
+  pieza que toca una zona (lo que se dibuja desde un mosaico cuenta como no visto). Desde la
+  versión 1.3.1 un píxel de una zona cuenta como visto si se ve con su valor original en
+  cualquier dibujo del documento, también de otra imagen de la salida que tenga ahí ese mismo
+  valor (con una imagen dibujada varias veces en una página, como un fondo en mosaico de
+  dibujos sueltos, la copia de una pieza cortada por el borde ya no da `REDACT_HIDDEN_PIXELS`),
+  y ningún dibujo puede conservar con su valor original un píxel que queda bajo una zona,
+  aunque otro dibujo lo muestre. También desde la 1.3.1, la copia que se hace de cada dibujo
+  tocado de una imagen que la página sigue usando en otros dibujos se comprime como la
+  original (antes quedaba en Flate y la salida crecía mucho), y una JPEG con `/ASCII85Decode`
+  o `/ASCIIHexDecode` delante se recomprime con sus mismas tablas. Y desde la 1.3.1 la
+  verificación final decodifica todas las imágenes de la salida que vienen de una imagen
+  censurada (copias de cada página, de patrón y de piezas repetidas), también las que la
+  contención ya había comprobado al hacerlas (antes no volvía a mirar esas copias si sus bytes
+  no cambiaban al guardar: JPEG, JPEG 2000 y 1 bit); y una imagen que viene de una censurada
+  y no se puede decodificar o comparar con ella (p. ej., en otro espacio de color) cuenta como
+  resto.
 
   `SHARED_IMAGE_UNSUPPORTED`: una zona toca una imagen que no se puede copiar por página: una
   imagen dibujada desde un patrón de mosaico que usa también otra página (con el mismo patrón o
@@ -279,6 +310,22 @@ espacio de `Page.search_for` de PyMuPDF.
   {"success": false, "verified": false, "refused": "SHARED_IMAGE_TOO_LARGE",
    "estimate": {"bytes": 222279891, "seconds": 157, "copies": 250, "memory": 1733783150,
                 "max_memory": 1503238553},
+   "applied": 0, "failed": []}
+  ```
+
+  `REDACT_TOO_HEAVY` (desde la versión 1.3.1): antes de censurar (y antes de poner las
+  anotaciones), por cada página con zonas y cada imagen JPEG 2000 (`/JPXDecode`) que usa y que
+  una zona toca, compartida o no (en una página girada, o si no se encuentra dónde se dibuja,
+  cualquier zona cuenta), sus megapíxeles por 1,0 s. Cada una se decodifica, se recodifica y se
+  vuelve a decodificar en la verificación: si la suma pasa de 180 s, `apply` no censura nada
+  (en menos de 1 s con 39 páginas A4 a 300 ppp). Los números están calibrados para un servidor
+  con un tope de 240 s por proceso: 180 s es su 75 %, y 1,0 s por megapíxel, lo medido con un
+  escaneo JPEG 2000 5/3 truncado de 22 páginas por 1,3 (0,99). Con 2480 × 3508 por página,
+  pasan 20 páginas censuradas y no 21.
+
+  ```json
+  {"success": false, "verified": false, "refused": "REDACT_TOO_HEAVY",
+   "estimate": {"seconds": 182.7, "megapixels": 182.7, "images": 21},
    "applied": 0, "failed": []}
   ```
 
@@ -333,20 +380,85 @@ de la página como imágenes en línea. Con Ghostscript: `-dDownsampleMonoImages
   ninguna página que tenía contenido (texto o imágenes) ha quedado vacía; 2; 3 si
   `ENTRADA` tiene contraseña de apertura; 4 en cualquier otro caso.
 
+### `pdf_check.py info ENTRADA INFORME`
+
+Desde la versión 1.3.0.
+
+- `INFORME` (escribe): `{"signed": false, "pdfa": "1B"}`.
+
+  | Campo | Tipo | Descripción |
+  |---|---|---|
+  | `signed` | booleano | La entrada lleva una firma electrónica (ver Reglas comunes). |
+  | `pdfa` | cadena o `null` | Parte y nivel de PDF/A que declara (`"1B"`, `"2U"`, `"3A"`…; solo la parte si no declara nivel), o `null`. |
+
+- Salida: 0; 1; 2; 3 (entonces no escribe `INFORME`).
+
+### `lossless_clean.py ENTRADA SALIDA`
+
+Desde la versión 1.3.0. Compresión sin pérdida, sin compresor externo:
+
+- Envuelve en Flate los JPEG cuando así ocupan menos (los bytes del JPEG no cambian).
+- Recorta las fuentes TrueType completas (`FontFile2`) a los glifos que se usan (subconjunto
+  de MuPDF) y quita su `/CIDSet`, que dejaría de ser cierto. No recorta las Type1
+  (`FontFile`), CFF ni OpenType (`FontFile3`), ni las Type3, ni las del formulario
+  (`/AcroForm /DR`): salen byte a byte como estaban.
+- Quita los objetos sin usar, une los repetidos, comprime con Flate lo que no está comprimido
+  y guarda con flujos de objetos y zlib al máximo.
+- No recodifica, no reduce ni cambia ninguna imagen, ni el contenido de las páginas.
+- Si ha recortado alguna fuente, compara el texto extraíble de cada página con el de la
+  entrada; si no es idéntico (o si el recorte falla), guarda otra vez sin recortar ninguna.
+- PDF/A (ver Reglas comunes): no recorta ninguna fuente y, en PDF/A-1, no usa flujos de
+  objetos (ISO 19005-1 no los admite). El XMP queda sin comprimir.
+- `SALIDA` (escribe) puede ocupar lo mismo o más que `ENTRADA`: decidir si compensa es cosa
+  de quien la usa.
+- Salida: 0; 1; 2; 3 (entonces no escribe `SALIDA`).
+
+### `perfil.py ENTRADA INFORME`
+
+Desde la versión 1.3.0.
+
+- `INFORME` (escribe): `{"hint": "vectorial", "shares": {...}}`. `shares` es el reparto de
+  los bytes de los flujos tal como están en el archivo, en fracción del tamaño total: `prot`
+  (imágenes protegidas, las de `protect`), `jpeg`, `sinperd` (el resto de imágenes) y
+  `fuentes`, más `jpeg_q` (calidad JPEG estimada por la tabla de luminancia, media ponderada
+  por bytes) y `jpeg_ppp` (resolución efectiva en la página, media ponderada), o `null` sin
+  JPEG.
+- `hint`, el primero que se cumple:
+
+  | Motivo | Regla |
+  |---|---|
+  | `bn_sin_perdida` | `prot` ≥ 0,8 |
+  | `vectorial` | `prot` + `jpeg` + `sinperd` < 0,05 |
+  | `jpeg_ya_optimizado` | `jpeg` ≥ 0,8, `jpeg_q` ≤ 75 y `jpeg_ppp` ≤ 200 |
+  | `escaneo_o_fotos_jpeg` | `jpeg` ≥ 0,8 |
+  | `otro` | lo demás |
+
+  No predice si un PDF se puede comprimir: solo describe de qué está hecho.
+- Salida: 0; 1; 2; 3.
+
 ## Cadena de compresión
 
-Comprimir un PDF sin estropear sus códigos de barras ni sus QR:
+Comprimir un PDF con pérdida (reduciendo y recodificando imágenes) sin estropear sus códigos
+de barras ni sus QR:
 
-1. `lossless_images.py protect`: sustituye las imágenes que no admiten pérdida por
+1. `lossless_clean.py`: limpieza sin pérdida (fuentes, objetos repetidos, Flate).
+2. `lossless_images.py protect`: sustituye las imágenes que no admiten pérdida por
    marcadores.
-2. Compresor externo (aquí, Ghostscript con `pdfwrite`): reduce y recodifica el resto; los
+3. Compresor externo (aquí, Ghostscript con `pdfwrite`): reduce y recodifica el resto; los
    marcadores pasan sin tocar.
-3. `jpeg_flate.py --originals` (restore): vuelve a poner las imágenes originales.
-4. `pdf_check.py verify`: comprueba el resultado antes de usarlo.
+4. `jpeg_flate.py --originals` (restore, con la salida del paso 1): vuelve a poner las imágenes
+   originales.
+5. `lossless_clean.py` otra vez, sobre la salida del compresor.
+6. `pdf_check.py verify`: comprueba el resultado antes de usarlo.
+
+El nivel `low` del servicio de PDFcadabra es solo el paso 1 seguido de `pdf_check.py verify`,
+sin Ghostscript. La limpieza antes del compresor le ahorra trabajo y bytes (una fuente o un
+logo repetidos en cada escrito de un expediente unido le llegan una sola vez) y la de después
+recorta lo que él deja.
 
 Este script ejecuta la cadena completa en local, sin nada más que el motor, Python y
 Ghostscript, con los mismos parámetros de Ghostscript que el servicio de PDFcadabra para
-cada nivel (`recommended`, `extreme` y `low`):
+cada nivel (`recommended` y `extreme`; con `low`, la limpieza sin pérdida):
 
 ```bash
 #!/usr/bin/env bash
@@ -359,56 +471,63 @@ NIVEL=${3:-recommended}
 MOTOR=${MOTOR:-.}
 
 # Preset de Ghostscript, resolución de las imágenes en color y gris (ppp) y calidad JPEG
-# (QFactor) de cada nivel. "low" no reduce ni recodifica imágenes.
+# (QFactor) de cada nivel.
 case "$NIVEL" in
   recommended) AJUSTE=/ebook;   PPP=150; Q=0.7 ;;
   extreme)     AJUSTE=/screen;  PPP=100; Q=0.8 ;;
-  low)         AJUSTE=/printer; PPP="";  Q="" ;;
+  low) ;;
   *) echo "Nivel desconocido: $NIVEL" >&2; exit 2 ;;
 esac
 
 TRABAJO=$(mktemp -d)
 trap 'rm -rf "$TRABAJO"' EXIT
 
-# 1. protect: N imágenes sustituidas por marcadores (con 0 no escribe nada).
-N=$(python3 "$MOTOR/lossless_images.py" protect "$ENTRADA" "$TRABAJO/marcado.pdf")
+# "low": sin pérdida y sin Ghostscript.
+if [ "$NIVEL" = low ]; then
+  python3 "$MOTOR/lossless_clean.py" "$ENTRADA" "$TRABAJO/final.pdf"
+  python3 "$MOTOR/pdf_check.py" verify "$ENTRADA" "$TRABAJO/final.pdf"
+  cp "$TRABAJO/final.pdf" "$SALIDA"
+  ls -l "$ENTRADA" "$SALIDA"
+  exit 0
+fi
+
+# 1. Limpieza sin pérdida antes del compresor.
+python3 "$MOTOR/lossless_clean.py" "$ENTRADA" "$TRABAJO/limpio.pdf"
+
+# 2. protect: N imágenes sustituidas por marcadores (con 0 no escribe nada).
+N=$(python3 "$MOTOR/lossless_images.py" protect "$TRABAJO/limpio.pdf" "$TRABAJO/marcado.pdf")
 if [ "$N" -gt 0 ]; then
   GS_ENTRADA=$TRABAJO/marcado.pdf
-  ORIGINALES=(--originals "$ENTRADA")
+  ORIGINALES=(--originals "$TRABAJO/limpio.pdf")
 else
-  GS_ENTRADA=$ENTRADA
+  GS_ENTRADA=$TRABAJO/limpio.pdf
   ORIGINALES=()
 fi
 
-# 2. Ghostscript. Las imágenes de 1 bit no se reducen y van en CCITT G4 sin pérdida, y
+# 3. Ghostscript. Las imágenes de 1 bit no se reducen y van en CCITT G4 sin pérdida, y
 # -dMaxInlineImageSize=0 impide que meta los marcadores en el contenido de la página.
-GS_ARGS=(-sDEVICE=pdfwrite -dCompatibilityLevel=1.4 "-dPDFSETTINGS=$AJUSTE")
-if [ -n "$PPP" ]; then
-  GS_ARGS+=(-dDownsampleColorImages=true "-dColorImageResolution=$PPP" -dColorImageDownsampleThreshold=1
-            -dDownsampleGrayImages=true "-dGrayImageResolution=$PPP" -dGrayImageDownsampleThreshold=1)
-else
-  GS_ARGS+=(-dDownsampleColorImages=false -dDownsampleGrayImages=false)
-fi
-GS_ARGS+=(-dColorImageDownsampleType=/Bicubic -dGrayImageDownsampleType=/Bicubic)
-if [ -n "$Q" ]; then
-  GS_ARGS+=(-dAutoFilterColorImages=false -dColorImageFilter=/DCTEncode
-            -dAutoFilterGrayImages=false -dGrayImageFilter=/DCTEncode
-            -dPassThroughJPEGImages=false)
-fi
-GS_ARGS+=(-dDownsampleMonoImages=false -dMonoImageFilter=/CCITTFaxEncode
-          -dMaxInlineImageSize=0
-          -dNOPAUSE -dQUIET -dBATCH "-sOutputFile=$TRABAJO/gs.pdf")
-if [ -n "$Q" ]; then
-  # La calidad JPEG solo se puede fijar con setdistillerparams, después del preset.
-  DICT="<< /QFactor $Q /Blend 1 /HSamples [2 1 1 2] /VSamples [2 1 1 2] >>"
-  GS_ARGS+=(-c "<< /ColorImageDict $DICT /GrayImageDict $DICT >> setdistillerparams" -f)
-fi
+GS_ARGS=(-sDEVICE=pdfwrite -dCompatibilityLevel=1.4 "-dPDFSETTINGS=$AJUSTE"
+         -dDownsampleColorImages=true "-dColorImageResolution=$PPP" -dColorImageDownsampleThreshold=1
+         -dDownsampleGrayImages=true "-dGrayImageResolution=$PPP" -dGrayImageDownsampleThreshold=1
+         -dColorImageDownsampleType=/Bicubic -dGrayImageDownsampleType=/Bicubic
+         -dAutoFilterColorImages=false -dColorImageFilter=/DCTEncode
+         -dAutoFilterGrayImages=false -dGrayImageFilter=/DCTEncode
+         -dPassThroughJPEGImages=false
+         -dDownsampleMonoImages=false -dMonoImageFilter=/CCITTFaxEncode
+         -dMaxInlineImageSize=0
+         -dNOPAUSE -dQUIET -dBATCH "-sOutputFile=$TRABAJO/gs.pdf")
+# La calidad JPEG solo se puede fijar con setdistillerparams, después del preset.
+DICT="<< /QFactor $Q /Blend 1 /HSamples [2 1 1 2] /VSamples [2 1 1 2] >>"
+GS_ARGS+=(-c "<< /ColorImageDict $DICT /GrayImageDict $DICT >> setdistillerparams" -f)
 gs "${GS_ARGS[@]}" "$GS_ENTRADA"
 
-# 3. restore: imágenes originales en su sitio y JPEG envueltos en Flate.
-python3 "$MOTOR/jpeg_flate.py" "$TRABAJO/gs.pdf" "$TRABAJO/final.pdf" "${ORIGINALES[@]}"
+# 4. restore: imágenes originales en su sitio y JPEG envueltos en Flate.
+python3 "$MOTOR/jpeg_flate.py" "$TRABAJO/gs.pdf" "$TRABAJO/restaurado.pdf" "${ORIGINALES[@]}"
 
-# 4. verify: si el resultado no es válido, sale con un código distinto de 0 (set -e).
+# 5. Limpieza sin pérdida de la salida del compresor.
+python3 "$MOTOR/lossless_clean.py" "$TRABAJO/restaurado.pdf" "$TRABAJO/final.pdf"
+
+# 6. verify: si el resultado no es válido, sale con un código distinto de 0 (set -e).
 python3 "$MOTOR/pdf_check.py" verify "$ENTRADA" "$TRABAJO/final.pdf"
 
 cp "$TRABAJO/final.pdf" "$SALIDA"
@@ -423,16 +542,18 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/datos" -e MOTOR=/motor \
   --entrypoint bash pdfcadabra-motor /datos/comprimir.sh /datos/entrada.pdf /datos/salida.pdf recommended
 ```
 
-El servicio de PDFcadabra hace además algo que el script deja fuera: si el nivel pedido no
-reduce el tamaño al menos un 2 %, repite la cadena con `low`; si tampoco, o si `verify`
-falla, entrega la entrada sin tocar.
+El servicio de PDFcadabra hace además algo que el script deja fuera: un nivel nunca entrega un
+archivo mayor que uno inferior. Calcula también los niveles inferiores (`extreme` también
+`recommended`, y los dos también `low`), con la salida del compresor antes y después del paso 5,
+y entrega el menor de todos si reduce el tamaño al menos un 2 %; si no, o si `verify` falla en
+todos, la entrada sin tocar.
 
 ## Dependencias y licencias
 
 | Componente | Versión | Licencia | Uso |
 |---|---|---|---|
 | [PyMuPDF](https://pypi.org/project/PyMuPDF/1.28.2/) (incluye MuPDF) | 1.28.2 | AGPL-3.0 (o licencia comercial de Artifex) | Todo el motor. |
-| [Pillow](https://pypi.org/project/pillow/12.3.0/) | 12.3.0 | MIT-CMU | Recodificar las imágenes censuradas. |
+| [Pillow](https://pypi.org/project/pillow/12.3.0/) | 12.3.0 | MIT-CMU | Recodificar las imágenes censuradas y leer la calidad de los JPEG (perfil). |
 | [zxing-cpp](https://pypi.org/project/zxing-cpp/3.1.1/) | 3.1.1 | Apache-2.0 | Solo tests. |
 | Ghostscript | la del sistema | AGPL-3.0-or-later | Compresor externo de la cadena de compresión (programa aparte, por línea de comandos). |
 

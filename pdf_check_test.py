@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Blanca Molina Rojas (PDFcadabra)
-"""Tests de pdf_check.py y de la detección de PDF con contraseña en lossless_images.py y
-redact.py, con PDFs sintéticos (PyMuPDF real): python -m unittest pdf_check_test.py
+"""Tests de pdf_check.py (verify, info, firma y PDF/A) y de la detección de PDF con contraseña
+y de firma en lossless_images.py y redact.py, con PDFs sintéticos (PyMuPDF real):
+python -m unittest pdf_check_test.py
 """
 import json
 import os
@@ -110,6 +111,98 @@ class PdfCheckTest(unittest.TestCase):
             if code == 0:
                 with open(results, encoding="utf-8") as f:
                     self.assertTrue(json.load(f)["results"])
+
+
+def signed_pdf(path, kind="field", sign=True):
+    """Firma con la estructura de PAdES (el contenido CMS es de relleno: solo se detecta, no se
+    valida). kind: "field" (campo /FT /Sig con /V indirecto), "direct" (con el /V directo en el
+    campo), "timestamp" (sello de tiempo de documento, /DocTimeStamp) o "empty" (campo de firma
+    sin firmar)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=200)
+    page.insert_text((20, 100), "Resolución firmada", fontsize=14)
+    sig = (f"<< /Type /{'DocTimeStamp' if kind == 'timestamp' else 'Sig'} /Filter /Adobe.PPKLite "
+           f"/SubFilter /{'ETSI.RFC3161' if kind == 'timestamp' else 'ETSI.CAdES.detached'} "
+           f"/ByteRange [0 1000 9000 500] /Contents <{'00' * 4000}> /M (D:20261024120000+02'00') >>")
+    field = doc.get_new_xref()
+    value = ""
+    if kind in ("field", "timestamp"):
+        sx = doc.get_new_xref()
+        doc.update_object(sx, sig)
+        value = f"/V {sx} 0 R"
+    elif kind == "direct":
+        value = f"/V {sig}"
+    doc.update_object(field, f"<< /FT /Sig /T (Firma1) /Type /Annot /Subtype /Widget /Rect [0 0 0 0] /F 132 "
+                             f"/P {page.xref} 0 R {value} >>")
+    doc.xref_set_key(page.xref, "Annots", f"[{field} 0 R]")
+    doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields [{field} 0 R] /SigFlags 3 >>")
+    doc.save(path)
+    return path
+
+
+class FirmaYPdfA(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def path(self, name):
+        return os.path.join(self.dir.name, name)
+
+    def test_firma_detectada(self):
+        for kind in ("field", "direct", "timestamp"):
+            with self.subTest(kind=kind):
+                self.assertTrue(pdf_check.signed(pymupdf.open(signed_pdf(self.path(f"{kind}.pdf"), kind))))
+
+    def test_sin_firma(self):
+        self.assertFalse(pdf_check.signed(pymupdf.open(signed_pdf(self.path("empty.pdf"), "empty"))))
+        self.assertFalse(pdf_check.signed(pymupdf.open(make_pdf(self.path("plain.pdf")))))
+
+    def test_info(self):
+        report = self.path("info.json")
+        cases = ((signed_pdf(self.path("s.pdf")), {"signed": True, "pdfa": None}),
+                 (make_pdf(self.path("p.pdf")), {"signed": False, "pdfa": None}))
+        for pdf, expected in cases:
+            self.assertEqual(pdf_check.main(["", "info", pdf, report]), 0)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), expected)
+        doc = pymupdf.open(make_pdf(self.path("a.pdf")))
+        doc.set_xml_metadata('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+                             '<rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/" '
+                             'pdfaid:part="2" pdfaid:conformance="b"/></rdf:RDF></x:xmpmeta>')
+        doc.save(self.path("a2.pdf"))
+        self.assertEqual(pdf_check.main(["", "info", self.path("a2.pdf"), report]), 0)
+        with open(report, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"signed": False, "pdfa": "2B"})
+
+    def test_info_con_contrasena_de_apertura(self):
+        open_pw = make_pdf(self.path("a.pdf"), user_pw="qa1234", owner_pw="qa1234-owner")
+        report = self.path("info.json")
+        self.assertEqual(pdf_check.main(["", "info", open_pw, report]), pdf_check.EXIT_ENCRYPTED)
+        self.assertFalse(os.path.exists(report))
+        self.assertEqual(pdf_check.main(["", "info", open_pw]), 2)
+
+    def test_redact_informa_de_la_firma_en_search_y_apply(self):
+        patterns, items = self.path("patrones.json"), self.path("items.json")
+        with open(patterns, "w", encoding="utf-8") as f:
+            json.dump({"custom_0": "firmada"}, f)
+        for pdf, signed in ((signed_pdf(self.path("s.pdf")), True), (make_pdf(self.path("p.pdf")), False)):
+            with self.subTest(signed=signed):
+                results, report = self.path("r.json"), self.path("informe.json")
+                run = lambda *a: subprocess.run([sys.executable, os.path.join(HERE, "redact.py"), *a],
+                                                cwd=HERE, capture_output=True, text=True)
+                r = run("search", pdf, patterns, results)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(results, encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(data.get("signed"), True if signed else None)
+                with open(items, "w", encoding="utf-8") as f:
+                    json.dump([{"page": 0, "rect": [20, 85, 120, 105], "category": "Censura Manual", "text": "x"}], f)
+                r = run("apply", pdf, self.path("out.pdf"), items, report)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(report, encoding="utf-8") as f:
+                    rep = json.load(f)
+                self.assertTrue(rep["verified"])
+                self.assertEqual(rep.get("signed"), True if signed else None)
 
 
 if __name__ == "__main__":

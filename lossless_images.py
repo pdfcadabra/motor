@@ -36,6 +36,7 @@ import pdf_check
 MAX_COLORS = 16
 # Las de 8 bits se decodifican para contar colores: por encima de esto no compensa.
 MAX_COUNT_PIXELS = 40_000_000
+_PIL_MODES = {1: "L", 3: "RGB", 4: "CMYK"}
 MAGIC = b"PdCq"  # cabecera del marcador (4 bytes)
 MARK_W, MARK_H = 64, 2
 LOSSY_FILTERS = ("DCTDecode", "JPXDecode")
@@ -111,6 +112,22 @@ def _few_indices(doc, xref):
     return True
 
 
+def _few_colors(pix):
+    """¿Tiene pix (sin alfa) MAX_COLORS colores distintos o menos?
+
+    Pillow getcolors(N) devuelve None en cuanto pasa de N y no sigue contando (el mismo
+    método que el conteo de Anonimizar en a86af52, rama perf/anonimizar-colores). Antes,
+    Pixmap.color_count() contaba todos los de una foto o un escaneo en Flate. Misma decisión
+    (test ConteoDeColores). Otro número de componentes (DeviceN, Lab...), que Pillow no tiene:
+    color_count, como antes."""
+    mode = _PIL_MODES.get(pix.n)
+    if mode is None:
+        return pix.color_count() <= MAX_COLORS
+    from PIL import Image  # aquí: importarlo cuesta 16-30 ms y la mayoría de PDF no cuentan nada
+    img = Image.frombytes(mode, (pix.width, pix.height), pix.samples_mv)
+    return img.getcolors(MAX_COLORS) is not None
+
+
 def is_protected(doc, xref):
     if _key(doc, xref, "ImageMask")[1] == "true":
         return True
@@ -135,7 +152,7 @@ def is_protected(doc, xref):
         pix = pymupdf.Pixmap(doc, xref)
         if pix.alpha:
             pix = pymupdf.Pixmap(pix, 0)
-        return pix.color_count() <= MAX_COLORS
+        return _few_colors(pix)
     except Exception:
         return False
 

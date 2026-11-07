@@ -27,10 +27,9 @@ import lossless_images
 EXIT_RESTORE_FAILED = 4
 
 
-def main(input_path, output_path, originals_path=None):
-    doc = pymupdf.open(input_path)
-    if originals_path:
-        lossless_images.restore(doc, pymupdf.open(originals_path))
+def wrap_jpegs(doc):
+    """Envuelve en Flate (zlib 9) cada JPEG de `doc` que así ocupe menos. Sin pérdida: los
+    bytes del JPEG no cambian. También lo usa lossless_clean.py (nivel baja)."""
     for xref in range(1, doc.xref_length()):
         if doc.xref_get_key(xref, "Subtype") != ("name", "/Image"):
             continue
@@ -55,6 +54,12 @@ def main(input_path, output_path, originals_path=None):
         elif parms_type == "array":
             doc.xref_set_key(xref, "DecodeParms", "[null " + parms_value.strip()[1:])
 
+
+def main(input_path, output_path, originals_path=None):
+    doc = pymupdf.open(input_path)
+    if originals_path:
+        lossless_images.restore(doc, pymupdf.open(originals_path))
+    wrap_jpegs(doc)
     doc.save(output_path)
 
 

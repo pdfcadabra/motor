@@ -23,6 +23,7 @@ import warnings
 import pymupdf
 
 import jpeg_flate
+import lossless_clean
 import lossless_images as li
 import redact
 
@@ -202,15 +203,22 @@ def compress_args(level, inp, out):
 
 
 def compress(inp, level, d):
-    """Lo mismo que /v1/compress: protect -> gs (argumentos de server.js) -> jpeg_flate."""
-    marked, gs_out, out = (os.path.join(d, f"{level}-{n}.pdf") for n in ("marked", "gs", "out"))
-    doc = pymupdf.open(inp)
+    """La cadena de /v1/compress para un nivel: la baja, lossless_clean.py sin Ghostscript; las
+    otras, lossless_clean.py -> protect -> gs (argumentos de server.js) -> jpeg_flate ->
+    lossless_clean.py (server.js entrega además el menor de esos candidatos y de los de los
+    niveles inferiores; aquí se prueba la cadena entera)."""
+    low, marked, gs_out, post, out = (os.path.join(d, f"{level}-{n}.pdf") for n in ("low", "marked", "gs", "post", "out"))
+    lossless_clean.clean(inp, low)
+    if level == "low":
+        return low
+    doc = pymupdf.open(low)
     n = len(li.protect(doc))
     if n:
         doc.save(marked)
     doc.close()
-    subprocess.run([GS, *compress_args(level, marked if n else inp, gs_out)], check=True, capture_output=True)
-    jpeg_flate.main(gs_out, out, inp if n else None)
+    subprocess.run([GS, *compress_args(level, marked if n else low, gs_out)], check=True, capture_output=True)
+    jpeg_flate.main(gs_out, post, low if n else None)
+    lossless_clean.clean(post, out)
     return out
 
 
@@ -267,6 +275,175 @@ class Clasificacion(unittest.TestCase):
         protected = li.protect(doc)
         for m in smasks:
             self.assertNotIn(m, protected)
+
+
+def old_few_colors(pix):
+    """La decisión de antes de _few_colors: PyMuPDF contaba todos los colores."""
+    return pix.color_count() <= li.MAX_COLORS
+
+
+def as_pixmap(img):
+    cs = {"L": pymupdf.csGRAY, "RGB": pymupdf.csRGB, "CMYK": pymupdf.csCMYK}[img.mode]
+    return pymupdf.Pixmap(cs, img.width, img.height, img.tobytes(), 0)
+
+
+def scan_image(mode, w=850, h=1100, seed=7):
+    """Página escaneada: fondo con ruido, bloques de texto oscuros y una foto en una esquina."""
+    from PIL import Image
+    rng = random.Random(seed)
+    img = Image.new("L", (w, h))
+    img.putdata([min(255, 235 + rng.randrange(20)) if (y // 14) % 3 or x < 60 or x > w - 60
+                 else rng.randrange(80) for y in range(h) for x in range(w)])
+    img = img.convert(mode)
+    photo = Image.frombytes("RGB", (200, 150), bytes(rng.randrange(256) for _ in range(200 * 150 * 3)))
+    img.paste(photo.convert(mode), (w - 260, 60))
+    return img
+
+
+def code_image(kind, module):
+    """QR o Code128 en gris de 8 bits (2 colores)."""
+    from PIL import Image
+    bits = code_bits(kind, module)
+    img = Image.new("L", (len(bits[0]), len(bits)))
+    img.putdata([255 if v else 0 for row in bits for v in row])
+    return img
+
+
+def seal_image(n_colors, size=300):
+    """Sello de anillos concéntricos con n_colors colores RGB (el primero, blanco)."""
+    from PIL import Image
+    rng = random.Random(n_colors)
+    palette = [(255, 255, 255)] + [tuple(rng.randrange(256) for _ in range(3)) for _ in range(n_colors - 1)]
+    img = Image.new("RGB", (size, size))
+    img.putdata([palette[((x - size // 2) ** 2 + (y - size // 2) ** 2) // 300 % n_colors]
+                 for y in range(size) for x in range(size)])
+    return img
+
+
+def n_color_image(mode, n, channel=-1):
+    """n colores distintos que solo difieren en un canal, en franjas; el último, solo en el
+    último píxel (el que tiene que ver el conteo para pasar de 16)."""
+    from PIL import Image
+    bands = len(mode)
+    colors = [tuple(i if c == channel % bands else 0 for c in range(bands)) for i in range(n)]
+    w, h = 64, 48
+    total = w * h
+    pixels = [colors[i * (n - 1) // (total - 1)] for i in range(total)]
+    img = Image.new(mode, (w, h))
+    img.putdata(pixels if bands > 1 else [p[0] for p in pixels])
+    return img
+
+
+def color_corpus():
+    """[(nombre, imagen Pillow)]: escaneos y fotos en gris, RGB y CMYK (también decodificados de
+    JPEG y JPEG 2000: como un escaneo pasado a Flate por otra herramienta); QR y Code128;
+    sellos; B/N; y los bordes del umbral (16 y 17 colores, en cada canal)."""
+    import io
+    from PIL import Image
+    corpus = []
+
+    def add(name, img):
+        corpus.append((name, img))
+        for fmt, kw in (("JPEG", {"quality": 85}), ("JPEG2000", {"irreversible": False, "no_jp2": True})):
+            buf = io.BytesIO()
+            try:
+                img.save(buf, fmt, **kw)
+                pix = pymupdf.Pixmap(buf.getvalue())
+            except Exception:  # p. ej. CMYK, que Pillow no escribe en JPEG 2000
+                continue
+            if pix.alpha == 0 and pix.n in li._PIL_MODES:
+                corpus.append((f"{name} {fmt}", Image.frombytes(li._PIL_MODES[pix.n], (pix.width, pix.height), pix.samples)))
+
+    for mode in ("L", "RGB", "CMYK"):
+        add(f"escaneo {mode}", scan_image(mode))
+    rng = random.Random(5)
+    add("foto RGB", Image.frombytes("RGB", (300, 200), bytes(rng.randrange(256) for _ in range(300 * 200 * 3))))
+    for kind, module in (("qr", 3), ("qr", 2), ("bar", 2)):
+        code = code_image(kind, module)
+        for mode in ("L", "RGB", "CMYK"):
+            add(f"{kind} {module}px {mode}", code.convert(mode))
+    for n in (3, 12, 15, 16, 17, 40):
+        add(f"sello {n} colores", seal_image(n))
+        corpus.append((f"sello {n} colores CMYK", seal_image(n).convert("CMYK")))
+    bits = Image.new("1", (850, 1100), 1)
+    bits.paste(0, (100, 100, 600, 500))
+    for x in range(0, 850, 40):
+        bits.paste(0, (x, 600, x + 20, 1000))
+    add("B/N", bits.convert("L"))
+    corpus.append(("B/N RGB", bits.convert("RGB")))
+    for mode in ("L", "RGB", "CMYK"):
+        for channel in range(len(mode)):
+            for n in (1, 2, 15, 16, 17, 18, 255):
+                corpus.append((f"{n} colores {mode} canal {channel}", n_color_image(mode, n, channel)))
+        corpus.append((f"1 píxel {mode}", Image.new(mode, (1, 1))))
+    return corpus
+
+
+def image_dict(img):
+    cs = {"L": "/DeviceGray", "RGB": "/DeviceRGB", "CMYK": "/DeviceCMYK"}[img.mode]
+    return f"/BitsPerComponent 8 /ColorSpace {cs}"
+
+
+@unittest.skipIf(zxingcpp is None, "hacen falta zxing-cpp y Pillow (requirements-test.txt)")
+class ConteoDeColores(unittest.TestCase):
+    """_few_colors para en el color 17 (Pixmap.color_count los contaba todos). Tiene que decidir
+    lo mismo que antes en todas las imágenes; el banco de Comprimir, con
+    scripts/estudio-comprimir-bajo/equivalencia_colores.py."""
+
+    def test_misma_decision_que_color_count(self):
+        sides = {True: 0, False: 0}
+        for name, img in color_corpus():
+            with self.subTest(name):
+                pix = as_pixmap(img)
+                old = old_few_colors(pix)
+                self.assertEqual(li._few_colors(pix), old)
+                sides[old] += 1
+        self.assertGreater(sides[True], 20)  # el corpus cubre los dos lados del umbral
+        self.assertGreater(sides[False], 20)
+
+    def test_sin_modo_de_pillow_cuenta_como_antes(self):
+        # Gris con alfa (n = 2): is_protected quita el alfa antes, pero _few_colors no lo supone.
+        for n in (16, 17):
+            pix = pymupdf.Pixmap(pymupdf.csGRAY, 64, 1, bytes(v for i in range(64) for v in (i % n, 255)), 1)
+            self.assertEqual(li._few_colors(pix), old_few_colors(pix), n)
+
+    def test_misma_decision_en_protect(self):
+        """Las imágenes de 8 bits sin JPEG de un PDF, decodificadas por MuPDF como en
+        is_protected (también con /SMask y /Decode): mismas protegidas que con color_count.
+        Sellos de hasta 16 colores, B/N y códigos, siempre protegidos."""
+        from unittest import mock
+        doc = pymupdf.open()
+        names = {}
+        for name, img in color_corpus():
+            for variant, extra in (("", ""), (" con /Decode", "/Decode [" + " 1 0" * len(img.mode) + "]")):
+                x = doc.get_new_xref()
+                doc.update_object(x, f"<< /Type /XObject /Subtype /Image /Width {img.width} /Height {img.height} "
+                                     f"{image_dict(img)} {extra} >>")
+                doc.update_stream(x, img.tobytes())
+                names[x] = name + variant
+        rng = random.Random(9)
+        for n in (16, 17):  # RGB con /SMask: is_protected quita el alfa antes de contar
+            img = n_color_image("RGB", n)
+            mask = doc.get_new_xref()
+            doc.update_object(mask, f"<< /Type /XObject /Subtype /Image /Width {img.width} /Height {img.height} "
+                                    "/BitsPerComponent 8 /ColorSpace /DeviceGray >>")
+            doc.update_stream(mask, bytes(rng.randrange(256) for _ in range(img.width * img.height)))
+            x = doc.get_new_xref()
+            doc.update_object(x, f"<< /Type /XObject /Subtype /Image /Width {img.width} /Height {img.height} "
+                                 f"{image_dict(img)} /SMask {mask} 0 R >>")
+            doc.update_stream(x, img.tobytes())
+            names[x] = f"{n} colores con /SMask"
+            names[mask] = f"/SMask de {n} colores"
+        new = {x: li.is_protected(doc, x) for x in names}
+        with mock.patch.object(li, "_few_colors", old_few_colors):
+            old = {x: li.is_protected(doc, x) for x in names}
+        self.assertEqual({names[x] for x in names if new[x] != old[x]}, set())
+        for x, name in names.items():
+            if name.startswith(("qr ", "bar ", "B/N", "sello 3 ", "sello 12 ", "sello 15 ", "sello 16 ")) \
+                    and "JPEG" not in name:
+                self.assertTrue(new[x], name)
+            if name.startswith(("escaneo", "foto", "sello 17 ", "sello 40 ")):
+                self.assertFalse(new[x], name)
 
 
 class ProtegerYRestaurar(unittest.TestCase):

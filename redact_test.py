@@ -1073,6 +1073,151 @@ class ImagenCompartidaGrande(unittest.TestCase):
         self.assertEqual(est["copies"], 2)
 
 
+# ==========================================
+# Aviso previo con JPEG 2000 censurado (REDACT_TOO_HEAVY)
+# ==========================================
+JPX_W, JPX_H = 2480, 3508  # A4 a 300 ppp, como el caso 15 y el 05 del banco del estudio
+_JPX_PAGE = None
+
+
+def jpx_page():
+    """Una página A4 a 300 ppp en JPEG 2000 (texto sobre blanco, 5/3 truncado a tasa 20, como el
+    caso 15). El aviso previo no la decodifica: solo cuentan su tamaño y su filtro."""
+    global _JPX_PAGE
+    if _JPX_PAGE is None:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (JPX_W, JPX_H), "white")
+        d = ImageDraw.Draw(img)
+        for i in range(60):
+            d.text((150, 120 + 52 * i), "juicio ordinario 123/2026 procurador letrado " * 3, fill=(20, 30, 120))
+        _JPX_PAGE = encode(img, "JPEG2000", quality_mode="rates", quality_layers=[20], no_jp2=True)
+    return _JPX_PAGE
+
+
+def make_jpx_pdf(path, pages, shared=False, rect=None):
+    """`pages` páginas A4 con una imagen JPEG 2000 de 2480 × 3508 en `rect` (por defecto, la
+    página entera): un objeto por página o, con shared, uno para todas."""
+    doc = fitz.open()
+    image = None
+    for _ in range(pages):
+        page = doc.new_page(width=595, height=842)
+        if image is None or not shared:
+            image = doc.get_new_xref()
+            doc.update_object(image, f"<< /Type /XObject /Subtype /Image /Width {JPX_W} /Height {JPX_H} "
+                                     "/ColorSpace /DeviceRGB /BitsPerComponent 8 >>")
+            doc.update_stream(image, jpx_page(), compress=False)
+            doc.xref_set_key(image, "Filter", "/JPXDecode")
+        r = rect or page.rect
+        page.insert_text((0, 0), " ")  # crea /Contents y /Resources
+        res = int(doc.xref_get_key(page.xref, "Resources")[1].split()[0])
+        doc.xref_set_key(res, "XObject", f"<< /Im {image} 0 R >>")
+        c = page.get_contents()[0]
+        doc.update_stream(c, doc.xref_stream(c) + f"\nq {r.width} 0 0 {r.height} {r.x0} {842 - r.y1} cm /Im Do Q".encode())
+    doc.save(path)
+    doc.close()
+
+
+class JpegGrandeCensurado(unittest.TestCase):
+    """Cada JPEG 2000 que toca una zona se decodifica, se recodifica y se vuelve a decodificar en
+    la verificación: el caso 15 del banco del estudio (39 págs. A4 a 300 ppp, 5/3 truncado) tarda
+    242 s en el contenedor endurecido, unos 315 s en producción, por encima del tope de 240 s.
+    Antes de censurar se estima (JPX_SECONDS_PER_MPX por megapíxel censurado) y, por encima de
+    JPX_MAX_SECONDS (el 75 % del tope), se rechaza con REDACT_TOO_HEAVY en menos de 1 s."""
+
+    def apply_until_estimate(self, src, items):
+        """(estimación JPEG 2000, informe): si el aviso de JPEG 2000 no rechaza, se para justo
+        después, sin censurar nada (informe None)."""
+        from unittest import mock
+        seen = []
+        real = redact.jpx_estimate
+
+        def spy(doc, zones):
+            seen.append(real(doc, zones))
+            return seen[-1]
+
+        def stop(*a, **k):
+            raise _Parado
+
+        out = tmp_path(self, "out.pdf")
+        with mock.patch.object(redact, "jpx_estimate", spy), \
+                mock.patch.object(redact, "shared_image_estimate", stop):
+            try:
+                report = redact.apply(src, out, items)
+            except _Parado:
+                report = None
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(os.path.exists(out))
+        return seen[0], report
+
+    def test_como_el_caso_15_se_rechaza_en_menos_de_un_segundo(self):
+        import time
+        src, out = tmp_path(self, "in.pdf"), tmp_path(self, "out.pdf")
+        make_jpx_pdf(src, 39)
+        t = time.monotonic()
+        report = redact.apply(src, out, manual_zones(39))
+        elapsed = time.monotonic() - t
+        self.assertEqual(report["refused"], "REDACT_TOO_HEAVY")
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["applied"], 0)
+        # Deja de contar en cuanto pasa del límite: 21 imágenes, 183 Mpx, 183 s.
+        self.assertGreater(report["estimate"]["seconds"], redact.JPX_MAX_SECONDS)
+        self.assertEqual(report["estimate"]["images"], 21)
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(os.path.exists(out))
+
+    def test_como_el_05_pasa(self):
+        """20 páginas (174 Mpx): 174 s estimados, por debajo de 180."""
+        src = tmp_path(self, "in.pdf")
+        make_jpx_pdf(src, 20)
+        est, report = self.apply_until_estimate(src, manual_zones(20))
+        self.assertIsNone(report)
+        self.assertEqual(est["images"], 20)
+        self.assertAlmostEqual(est["seconds"], 174.0, delta=0.2)
+
+    def test_el_limite_esta_entre_20_y_21_paginas(self):
+        """20 páginas a 300 ppp, 174 s; 21, 183 s (medido con 20 y 22 del caso 15 en el
+        contenedor endurecido: ver CLAUDE.md)."""
+        src = tmp_path(self, "in.pdf")
+        make_jpx_pdf(src, 20)
+        est, report = self.apply_until_estimate(src, manual_zones(20))
+        self.assertIsNone(report)
+        self.assertLess(est["seconds"], redact.JPX_MAX_SECONDS)
+        make_jpx_pdf(src, 21)
+        est, report = self.apply_until_estimate(src, manual_zones(21))
+        self.assertEqual(report["refused"], "REDACT_TOO_HEAVY")
+
+    def test_tambien_si_la_imagen_es_compartida(self):
+        src = tmp_path(self, "in.pdf")
+        make_jpx_pdf(src, 39, shared=True)
+        _, report = self.apply_until_estimate(src, manual_zones(39))
+        self.assertEqual(report["refused"], "REDACT_TOO_HEAVY")
+
+    def test_solo_cuentan_las_que_toca_una_zona(self):
+        """La imagen en la mitad de abajo y las zonas arriba: no se censura ninguna imagen."""
+        src = tmp_path(self, "in.pdf")
+        make_jpx_pdf(src, 39, rect=fitz.Rect(0, 500, 595, 842))
+        zones = [{"id": f"m{n}", "page": n, "category": "Censura Manual", "text": "Censura Manual",
+                  "rect": [100, 100, 300, 120]} for n in range(39)]
+        est, report = self.apply_until_estimate(src, zones)
+        self.assertIsNone(report)
+        self.assertEqual(est["images"], 0)
+        self.assertEqual(est["seconds"], 0)
+
+    def test_en_una_pagina_girada_cualquier_zona_cuenta(self):
+        src = tmp_path(self, "in.pdf")
+        make_jpx_pdf(src, 39, rect=fitz.Rect(0, 500, 595, 842))
+        doc = fitz.open(src)
+        for page in doc:
+            page.set_rotation(90)
+        rotated = tmp_path(self, "girado.pdf")
+        doc.save(rotated)
+        doc.close()
+        zones = [{"id": f"m{n}", "page": n, "category": "Censura Manual", "text": "Censura Manual",
+                  "rect": [100, 100, 300, 120]} for n in range(39)]
+        _, report = self.apply_until_estimate(rotated, zones)
+        self.assertEqual(report["refused"], "REDACT_TOO_HEAVY")
+
+
 class BusquedaConRepeticiones(unittest.TestCase):
     """Un valor que se repite en la página se busca con search_for una sola vez (devuelve todas
     sus apariciones). Antes, una vez por repetición: k llamadas y k² hallazgos que luego se
@@ -1689,14 +1834,88 @@ class ImagenCompartidaPixelesOcultos(unittest.TestCase):
 
     def test_copia_que_no_se_puede_hacer_cierra_en_fallo(self):
         """Si MuPDF no hace la copia de la página que ve media zona, esa página se queda con la
-        original, que no está entre las copias comprobadas (checked_digests): la verificación
-        final la decodifica y da 422. Con JPEG, donde la verificación se fía de las copias
-        comprobadas."""
+        original: la verificación final la decodifica y da 422. Con JPEG."""
         from unittest import mock
         src = tmp_path(self, "in.pdf")
         make_shared_pdf(src, "clip", "jpeg", extra=("mitad",))
         with mock.patch.object(redact._Scratch, "copy", lambda self, *a: None):
             report, out = self.apply(src, shared_zone())
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["leaks"], ["REDACT_HIDDEN_PIXELS"])
+        self.assertFalse(os.path.exists(out))
+
+    def faulty_contention(self, recolor=False):
+        """Fallo provocado (estudio de la copia común, 2026-11-04): la contención calcula para la
+        copia de una página una máscara a la que le falta la última columna de la zona, la copia
+        conserva esa columna con su valor y erased_in, con la misma máscara, la da por borrada.
+        recolor: además, la copia queda en gris (otro espacio de color que la original)."""
+        from unittest import mock
+
+        def one_column_less(mask):
+            box = mask.getbbox()
+            if box is None:
+                return mask
+            mask = mask.copy()
+            for y in range(box[1], box[3]):
+                mask.putpixel((box[2] - 1, y), 0)
+            return mask
+
+        real_copy, real_erased = redact.HiddenPixels._copy, redact.erased_in
+
+        def copy(hp, xref, x, mask):
+            new = real_copy(hp, xref, x, one_column_less(mask))
+            if recolor and new is not None:
+                pix = fitz.Pixmap(fitz.csGRAY, fitz.Pixmap(hp.doc, new))
+                hp.doc.update_stream(new, zlib.compress(pix.samples), compress=False)
+                hp.doc.xref_set_key(new, "ColorSpace", "/DeviceGray")
+                hp.doc.xref_set_key(new, "Filter", "/FlateDecode")
+                hp.doc.xref_set_key(new, "DecodeParms", "null")
+            return new
+
+        return [mock.patch.object(redact.HiddenPixels, "_copy", copy),
+                mock.patch.object(redact, "erased_in", lambda doc, xref, box, mask:
+                                  real_erased(doc, xref, box, one_column_less(mask)))]
+
+    def apply_faulty(self, src, recolor=False, verify=True):
+        import contextlib
+        from unittest import mock
+        with contextlib.ExitStack() as stack:
+            for p in self.faulty_contention(recolor):
+                stack.enter_context(p)
+            if not verify:
+                stack.enter_context(mock.patch.object(redact, "hidden_image_pixels", lambda *a: False))
+            return self.apply(src, shared_zone())
+
+    def test_copia_con_un_fallo_no_se_da_por_buena(self):
+        """La verificación final decodifica todas las copias, también las que la contención ya
+        ha comprobado: con el fallo provocado, 422 REDACT_HIDDEN_PIXELS y sin salida. Hasta el
+        motor 1.3.1 no volvía a decodificar las copias comprobadas cuyos bytes no cambiaban al
+        guardar (JPEG, CMYK, JPEG 2000 y 1 bit en G4) y esas se entregaban como verificadas; las
+        de Flate sí, porque save() las vuelve a comprimir."""
+        for fmt in ("flate", "jpeg", "1bit", "cmyk", "jpx"):
+            with self.subTest(fmt=fmt):
+                src = tmp_path(self, "in.pdf")
+                make_shared_pdf(src, "clip", fmt, extra=("mitad",))
+                # Sin la verificación de las imágenes, la salida conserva la columna: el fallo
+                # deja un resto de verdad.
+                report, out = self.apply_faulty(src, verify=False)
+                self.assertTrue(report["verified"], report)
+                self.assertGreater(original_pixels_in_zones(src, out, shared_zone(),
+                                                            fmt in ("jpeg", "cmyk", "jpx")), 0)
+                report, out = self.apply_faulty(src)
+                self.assertFalse(report["verified"])
+                self.assertEqual(report["leaks"], ["REDACT_HIDDEN_PIXELS"])
+                self.assertFalse(os.path.exists(out))
+                # Sin el fallo, verificada.
+                report, out = self.apply(src, shared_zone())
+                self.assertTrue(report["verified"], report)
+
+    def test_copia_en_otro_espacio_de_color_cierra_en_fallo(self):
+        """Una copia que no se puede comparar con la original de la que viene seguro (la página
+        solo usaba esa) cuenta como resto: antes se saltaba como si viniera de otra imagen."""
+        src = tmp_path(self, "in.pdf")
+        make_shared_pdf(src, "clip", "flate", extra=("mitad",))
+        report, out = self.apply_faulty(src, recolor=True)
         self.assertFalse(report["verified"])
         self.assertEqual(report["leaks"], ["REDACT_HIDDEN_PIXELS"])
         self.assertFalse(os.path.exists(out))
@@ -2100,6 +2319,315 @@ class MosaicosDeChrome(unittest.TestCase):
                     report = redact.apply(src, out, mosaic_zone(page, x, y))
                     self.assertEqual(report.get("leaks"), ["REDACT_HIDDEN_PIXELS"], report)
                     self.assertFalse(os.path.exists(out))
+
+
+# Imagen dibujada varias veces en una página (fondo en mosaico de dibujos directos, como reportlab
+# con drawImage en bucle o el fondo de página en mosaico de Writer): piezas de 200 × 280 pt de una
+# imagen de 100 × 140 px, en x = 0, 200, 400 y, desde abajo, y = 0, 280, 560, 840 (la columna de
+# la derecha sale 5 pt por el borde y la fila de arriba casi entera). REPEATED_ZONE toca la pieza
+# A (200-400) y la B (400-600, cortada): en la copia de B que hace MuPDF quedan columnas de la zona
+# de A que en B caen fuera de la página, pero que las otras piezas muestran con su valor.
+REPEATED_W, REPEATED_H = 100, 140
+REPEATED_PIECES = [(x, y) for x in (0, 200, 400) for y in (0, 280, 560, 840)]
+REPEATED_ZONE = (380, 400, 500, 420)
+
+
+def repeated_image(seed=1, fmt="flate"):
+    """Ruido RGB determinista (ningún píxel blanco): cualquier píxel conservado se distingue.
+    Con fmt "1bit", trazos negros sobre blanco en 1 bit, como una máscara de texto."""
+    import random
+    from PIL import Image, ImageDraw
+    rnd = random.Random(seed)
+    if fmt == "1bit":
+        img = Image.new("1", (REPEATED_W, REPEATED_H), 1)
+        d = ImageDraw.Draw(img)
+        for y in range(2, REPEATED_H - 4, 6):
+            x = 2
+            while x < REPEATED_W - 4:
+                w = rnd.randrange(2, 9)
+                d.rectangle((x, y, min(x + w, REPEATED_W - 3), y + 3), fill=0)
+                x += w + rnd.randrange(2, 5)
+        return img
+    img = Image.frombytes("RGB", (REPEATED_W, REPEATED_H),
+                          bytes(rnd.randrange(0, 240) for _ in range(REPEATED_W * REPEATED_H * 3)))
+    return img
+
+
+def make_repeated_pdf(path, draws, clip=False, fmt="flate"):
+    """Una página A4 con dibujos de imagen: draws = [(imagen PIL, x, y)] (esquina inferior
+    izquierda, en pt, de una pieza de 200 × 280). Los dibujos con el mismo objeto PIL usan la
+    misma imagen (un solo XObject). clip: todo dentro de un recorte del tamaño de la página, como
+    Writer. fmt: flate, jpeg, jpeg-a85 (la JPEG con /ASCII85Decode delante, como reportlab) o
+    1bit (gris de 1 bit en Flate)."""
+    import io
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    xrefs, names, ops = {}, {}, ["q"]
+    if clip:
+        ops.append("0 0 595 842 re W n")
+    for img, x, y in draws:
+        if id(img) not in xrefs:
+            xref = doc.get_new_xref()
+            space = "/ColorSpace /DeviceRGB /BitsPerComponent 8"
+            if fmt in ("jpeg", "jpeg-a85"):
+                buf = io.BytesIO()
+                img.save(buf, "JPEG", quality=90)
+                data, filt = buf.getvalue(), "/DCTDecode"
+                if fmt == "jpeg-a85":
+                    import base64
+                    data, filt = base64.a85encode(data, wrapcol=72) + b"~>", "[/ASCII85Decode /DCTDecode]"
+            elif fmt == "1bit":
+                data, filt = zlib.compress(img.tobytes()), "/FlateDecode"
+                space = "/ColorSpace /DeviceGray /BitsPerComponent 1"
+            else:
+                data, filt = zlib.compress(img.tobytes()), "/FlateDecode"
+            _stream_object(doc, xref, f"/Type /XObject /Subtype /Image /Width {REPEATED_W} "
+                                      f"/Height {REPEATED_H} {space}", data, filt)
+            xrefs[id(img)] = xref
+            names[id(img)] = f"Im{len(names)}"
+        ops.append(f"q 200 0 0 280 {x} {y} cm /{names[id(img)]} Do Q")
+    ops.append("Q")
+    resources = " ".join(f"/{names[k]} {xrefs[k]} 0 R" for k in xrefs)
+    res = doc.get_new_xref()
+    doc.update_object(res, f"<< /XObject << {resources} >> >>")
+    doc.xref_set_key(page.xref, "Resources", f"{res} 0 R")
+    contents = doc.get_new_xref()
+    doc.update_object(contents, "<<>>")
+    doc.update_stream(contents, "\n".join(ops).encode())
+    doc.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+    doc.save(path)
+
+
+def repeated_zone_pixels(x0, x1, y_top):
+    """Píxeles (columnas, filas) de una pieza que toca REPEATED_ZONE, si la pieza empieza en
+    x0-x1 y su borde de arriba está en y_top (coordenadas de PyMuPDF): 2 pt por píxel."""
+    zx0, zy0, zx1, zy1 = REPEATED_ZONE
+    c0, c1 = max(0, int((zx0 - x0) // 2)), min(REPEATED_W, -int(-(zx1 - x0) // 2))
+    r0, r1 = int((zy0 - y_top) // 2), -int(-(zy1 - y_top) // 2)
+    return c0, r0, c1, r1
+
+
+def repeated_erased(img, rects):
+    """Copia de img con esos píxeles (c0, r0, c1, r1) en blanco, como el borrado de MuPDF."""
+    from PIL import ImageDraw
+    out = img.copy()
+    for c0, r0, c1, r1 in rects:
+        ImageDraw.Draw(out).rectangle((c0, r0, c1 - 1, r1 - 1), fill=(255, 255, 255))
+    return out
+
+
+class ImagenRepetidaEnLaPagina(unittest.TestCase):
+    """Falso positivo de la 1.2.1 (REDACT_HIDDEN_PIXELS sin restos): con una imagen dibujada
+    varias veces en una página, MuPDF hace una copia por dibujo tocado y la original sigue en las
+    otras piezas. La copia de una pieza cortada por el borde conserva columnas de la zona de la
+    otra pieza que caen fuera de la página; no es un resto, porque las otras piezas las muestran
+    con su valor. La verificación cuenta todas las apariciones de la original, pero dentro de una
+    zona no puede quedar nada aunque otra pieza lo muestre."""
+
+    # Piezas que toca REPEATED_ZONE: A (200-400) y B (400-600), en la fila que va de y = 282 a 562
+    # en coordenadas de PyMuPDF (280-560 desde abajo).
+    ROW_TOP = 842 - 560
+    ZONE_A = repeated_zone_pixels(200, 400, ROW_TOP)
+    ZONE_B = repeated_zone_pixels(400, 600, ROW_TOP)
+
+    def items(self):
+        return [{"id": "z", "page": 0, "category": redact.MANUAL_CATEGORY, "text": redact.MANUAL_CATEGORY,
+                 "rect": list(REPEATED_ZONE)}]
+
+    def under_zone_kept(self, src, out, lossy=False):
+        """Píxeles bajo la zona, en los dibujos de la salida, con el valor de la original (los
+        blancos de la original no cuentan: el borrado es blanco). Con pérdida, como la
+        verificación: en gris, a 16 o menos de la original donde esta está a 64 o más del blanco,
+        sin los 2 px del borde de la zona."""
+        from PIL import ImageChops
+        sdoc, odoc = fitz.open(src), fitz.open(out)
+        original = _pil(sdoc, sdoc[0].get_images()[0][0]).convert("RGB")
+        zone, total = fitz.Rect(REPEATED_ZONE), 0
+        for info in odoc[0].get_image_info(xrefs=True):
+            bbox = fitz.Rect(info["bbox"])
+            if not zone.intersects(bbox) or info["width"] != REPEATED_W:
+                continue
+            c0, r0, c1, r1 = repeated_zone_pixels(bbox.x0, bbox.x1, bbox.y0)
+            if lossy:
+                c0, r0, c1, r1 = c0 + 2, r0 + 2, c1 - 2, r1 - 2
+            a = original.crop((c0, r0, c1, r1))
+            b = _pil(odoc, info["xref"]).convert("RGB").crop((c0, r0, c1, r1))
+            diff = ImageChops.difference(a.convert("L"), b.convert("L")) if lossy else \
+                ImageChops.difference(a, b).convert("L")
+            limit = 16 if lossy else 0
+            total += sum(1 for d, o in zip(diff.getdata(), a.convert("L").getdata())
+                         if d <= limit and o <= (191 if lossy else 254))
+        return total
+
+    def check_apply(self, clip=False, fmt="flate", img=None):
+        src, out = tmp_path(self, "in.pdf"), tmp_path(self, "out.pdf")
+        img = img or repeated_image()
+        make_repeated_pdf(src, [(img, x, y) for x, y in REPEATED_PIECES], clip=clip, fmt=fmt)
+        report = redact.apply(src, out, self.items())
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(self.under_zone_kept(src, out, lossy=fmt.startswith("jpeg")), 0)
+        # Fuera de la zona (con 2 pt de margen), la página se ve igual: las otras piezas siguen
+        # con la original y las copias de A y B no cambian lo que muestran. En JPEG, las copias
+        # se recomprimen con las tablas de la original: en A y B el render cambia algo (con este
+        # ruido, el peor caso para JPEG, hasta 27 niveles y de media 3); el resto, idéntico.
+        from PIL import Image, ImageChops, ImageDraw, ImageStat
+        imgs = []
+        for path in (src, out):
+            with fitz.open(path) as doc:
+                pix = doc[0].get_pixmap(dpi=72)
+                imgs.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        diff = ImageChops.difference(*imgs).convert("L")
+        x0, y0, x1, y1 = REPEATED_ZONE
+        ImageDraw.Draw(diff).rectangle((x0 - 2, y0 - 2, x1 + 2, y1 + 2), fill=0)
+        touched = (200, self.ROW_TOP, 600, self.ROW_TOP + 280)  # piezas A y B
+        if fmt.startswith("jpeg"):
+            self.assertLessEqual(ImageStat.Stat(diff.crop(touched)).mean[0], 5)
+        else:
+            self.assertEqual(diff.getextrema()[1], 0)
+        ImageDraw.Draw(diff).rectangle(touched, fill=0)
+        self.assertEqual(diff.getextrema()[1], 0)
+        return src, out
+
+    def test_copias_comprimidas_como_la_original(self):
+        """Cada copia que hace MuPDF de una pieza tocada sale como su original aunque la original
+        siga en las otras piezas: JPEG con sus mismas tablas, sin pérdida si la original lo es
+        (1 bit en G4). Antes quedaban en Flate: un fondo JPEG de 0,4 MB daba 5,8 MB por pieza.
+        Tamaño: como mucho la entrada más dos copias (las dos piezas que toca la zona) del
+        tamaño de la original, con un 30 % de margen."""
+        import io
+        from PIL import Image
+        for fmt in ("flate", "jpeg", "jpeg-a85", "1bit"):
+            with self.subTest(fmt=fmt):
+                src, out = self.check_apply(fmt=fmt, img=repeated_image(fmt=fmt))
+                sdoc, odoc = fitz.open(src), fitz.open(out)
+                x = sdoc[0].get_images()[0][0]
+                stream = len(sdoc.xref_stream_raw(x))
+                copies = {im[0] for im in odoc[0].get_images(full=True)}
+                kept = {y for y in copies if odoc.xref_stream(y) == sdoc.xref_stream(x)
+                        and odoc.xref_get_key(y, "Filter") == sdoc.xref_get_key(x, "Filter")}
+                self.assertEqual(len(kept), 1)  # la original, en las otras piezas
+                self.assertEqual(len(copies - kept), 2)
+                for y in copies - kept:
+                    filters = odoc.xref_get_key(y, "Filter")[1]
+                    if fmt.startswith("jpeg"):
+                        self.assertIn("DCTDecode", filters)
+                        q = lambda d, z: Image.open(io.BytesIO(redact._original_jpeg(d, z))).quantization
+                        self.assertEqual(q(odoc, y), q(sdoc, x))
+                    elif fmt == "1bit":
+                        self.assertIn(filters, ("/CCITTFaxDecode", "/FlateDecode"))
+                    else:
+                        self.assertEqual(filters, "/FlateDecode")
+                self.assertLessEqual(os.path.getsize(out), os.path.getsize(src) + 2 * 1.3 * stream + 16_000)
+
+    def test_pieza_cortada_por_el_borde(self):
+        """El caso del estudio (reportlab): antes, REDACT_HIDDEN_PIXELS."""
+        self.check_apply()
+
+    def test_con_el_recorte_de_la_pagina_como_writer(self):
+        self.check_apply(clip=True)
+
+    def test_jpeg(self):
+        self.check_apply(fmt="jpeg")
+
+    def test_jpeg_detras_de_ascii85_o_asciihex(self):
+        """_original_jpeg quita las capas ASCII85, ASCIIHex y Flate de delante del DCTDecode (para
+        recomprimir con las tablas de la original); otra capa o con /DecodeParms, None."""
+        import base64
+        import io
+        buf = io.BytesIO()
+        repeated_image().save(buf, "JPEG", quality=90)
+        jpeg = buf.getvalue()
+        doc = fitz.open()
+        cases = {
+            "[/ASCII85Decode /DCTDecode]": (b"<~" + base64.a85encode(jpeg, wrapcol=60) + b"~>\n", jpeg),
+            "[/ASCIIHexDecode /DCTDecode]": (jpeg.hex().encode() + b">", jpeg),
+            "[/ASCII85Decode /FlateDecode /DCTDecode]": (base64.a85encode(zlib.compress(jpeg)) + b"~>", jpeg),
+            "[/RunLengthDecode /DCTDecode]": (jpeg, None),
+        }
+        for filt, (data, expected) in cases.items():
+            with self.subTest(filt=filt):
+                x = doc.get_new_xref()
+                _stream_object(doc, x, f"/Type /XObject /Subtype /Image /Width {REPEATED_W} "
+                                       f"/Height {REPEATED_H} /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                               data, filt)
+                self.assertEqual(redact._original_jpeg(doc, x), expected)
+        x = doc.get_new_xref()
+        _stream_object(doc, x, "/Type /XObject /Subtype /Image /Width 1 /Height 1",
+                       zlib.compress(jpeg), "[/FlateDecode /DCTDecode]")
+        doc.xref_set_key(x, "DecodeParms", "[<</Predictor 2>> null]")  # update_stream la quita
+        self.assertIsNone(redact._original_jpeg(doc, x))
+
+    def hidden(self, src, out):
+        with fitz.open(src) as doc:
+            zones = {0: [fitz.Rect(REPEATED_ZONE)]}
+            plan, unsupported, images = redact.hidden_pixels_plan(doc, zones)
+        self.assertFalse(unsupported)
+        self.assertTrue(plan)
+        return redact.hidden_image_pixels(src, out, plan, zones, images)
+
+    def pair(self, out_draws, in_draws=None):
+        """(entrada, salida) hechas a mano: en la entrada, la misma imagen en las piezas de
+        in_draws (o las de out_draws); en la salida, las imágenes de out_draws."""
+        img = repeated_image()
+        src, out = tmp_path(self, "in.pdf"), tmp_path(self, "out.pdf")
+        make_repeated_pdf(src, [(img, x, y) for _, x, y in (in_draws or out_draws)])
+        make_repeated_pdf(out, [(f(img), x, y) for f, x, y in out_draws])
+        return src, out
+
+    def test_bajo_la_zona_aunque_otra_pieza_lo_muestre(self):
+        """La original sin borrar bajo la zona (en la propia pieza, o una copia idéntica), y la
+        misma imagen visible en otra pieza: es un resto. Antes no se veía (la otra pieza contaba
+        como que lo mostraba)."""
+        same = lambda img: img
+        copy = lambda img: img.copy()
+        for under in (same, copy):
+            with self.subTest(copia=under is copy):
+                src, out = self.pair([(under, 200, 280), (same, 0, 280)])
+                self.assertTrue(self.hidden(src, out))
+
+    def test_oculto_sin_otra_aparicion_que_lo_muestre(self):
+        """La copia de B conserva la zona de A (fuera de la página en B) y la de A la tiene
+        borrada: no se ve en ningún sitio. Es un resto."""
+        a = lambda img: repeated_erased(img, [self.ZONE_A, self.ZONE_B])
+        b = lambda img: repeated_erased(img, [self.ZONE_B])
+        src, out = self.pair([(a, 200, 280), (b, 400, 280)])
+        self.assertTrue(self.hidden(src, out))
+
+    def test_oculto_pero_visible_en_otra_pieza(self):
+        """Lo mismo con una tercera pieza que muestra la original entera: no es un resto."""
+        a = lambda img: repeated_erased(img, [self.ZONE_A, self.ZONE_B])
+        b = lambda img: repeated_erased(img, [self.ZONE_B])
+        src, out = self.pair([(a, 200, 280), (b, 400, 280), (lambda img: img, 0, 280)])
+        self.assertFalse(self.hidden(src, out))
+
+    def test_la_otra_pieza_no_muestra_el_valor_original(self):
+        """Si la pieza que lo muestra tiene ahí otro valor (cambiado o borrado), no cuenta."""
+        from PIL import ImageChops
+        a = lambda img: repeated_erased(img, [self.ZONE_A, self.ZONE_B])
+        b = lambda img: repeated_erased(img, [self.ZONE_B])
+        for name, c in (("borrada", lambda img: repeated_erased(img, [self.ZONE_A])),
+                        ("cambiada", lambda img: ImageChops.add(img, img.point(lambda v: 1)))):
+            with self.subTest(otra=name):
+                src, out = self.pair([(a, 200, 280), (b, 400, 280), (c, 0, 280)])
+                self.assertTrue(self.hidden(src, out))
+
+    def test_mupdf_no_borra_bajo_la_zona(self):
+        """De extremo a extremo: si apply_redactions no tocara las imágenes, la original seguiría
+        bajo el negro (el render sale negro) y otra pieza la mostraría. 422."""
+        from unittest import mock
+        real = fitz.Page.apply_redactions
+
+        def no_images(page, *args, **kwargs):
+            kwargs["images"] = fitz.PDF_REDACT_IMAGE_NONE
+            return real(page, *args, **kwargs)
+
+        src, out = tmp_path(self, "in.pdf"), tmp_path(self, "out.pdf")
+        img = repeated_image()
+        make_repeated_pdf(src, [(img, x, y) for x, y in REPEATED_PIECES])
+        with mock.patch.object(fitz.Page, "apply_redactions", no_images):
+            report = redact.apply(src, out, self.items())
+        self.assertEqual(report.get("leaks"), ["REDACT_HIDDEN_PIXELS"], report)
+        self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,15 @@
   la entrada necesita contraseña; con EXIT_INVALID en cualquier otro caso (server.js devuelve
   entonces el original sin tocar). Motivo: con un PDF con contraseña de apertura, Ghostscript
   sale con 0 y escribe una página en blanco, que llegaba al usuario como "comprimido".
+- signed(doc): el PDF lleva alguna firma electrónica (un diccionario de firma con /ByteRange,
+  también como valor de un campo de formulario /FT /Sig). Cualquier reescritura la invalida.
+- pdfa(doc): la parte y el nivel de PDF/A que declaran los metadatos XMP (pdfaid), o None.
+- python3 pdf_check.py info <entrada.pdf> <informe.json>: escribe {"signed": bool, "pdfa":
+  "1B" | ... | null}. Sale con EXIT_ENCRYPTED si la entrada necesita contraseña (server.js lo
+  lanza lo primero en Comprimir: con la baja ya no hay otro paso antes que lo detecte).
 """
+import json
+import re
 import sys
 
 import pymupdf
@@ -23,6 +31,53 @@ EXIT_INVALID = 4  # server.js no entrega la salida
 def needs_password(doc):
     """True si el PDF solo se abre con una contraseña de apertura que no tenemos."""
     return bool(doc.needs_pass) and not doc.authenticate("")
+
+
+def signed(doc):
+    """True si hay alguna firma (o sello de tiempo de documento) aplicada: un diccionario con
+    /ByteRange y /Contents, sea un objeto propio o el /V directo de un campo /FT /Sig. Un campo
+    de firma vacío (sin /V) no cuenta."""
+    for xref in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(xref, "ByteRange")[0] == "array":
+                if doc.xref_get_key(xref, "Contents")[0] != "null":
+                    return True
+            elif doc.xref_get_key(xref, "FT")[1] == "/Sig":
+                if doc.xref_get_key(xref, "V/ByteRange")[0] == "array":
+                    return True
+        except Exception:  # noqa: BLE001 - un objeto dañado no es una firma
+            continue
+    return False
+
+
+PDFAID_NS = "http://www.aiim.org/pdfa/ns/id/"
+
+
+def pdfa(doc):
+    """{"part": 1, "conformance": "B"} según el XMP del catálogo (pdfaid:part y
+    pdfaid:conformance, como atributo o como elemento, con el prefijo que tenga el espacio de
+    nombres), o None si no declara PDF/A. Solo lo que declara: no valida la conformidad."""
+    try:
+        xmp = doc.get_xml_metadata() or ""
+    except Exception:  # noqa: BLE001
+        return None
+    prefixes = set(re.findall(r'xmlns:([\w.-]+)\s*=\s*["\']' + re.escape(PDFAID_NS) + '["\']', xmp))
+    for prefix in prefixes:
+        def value(name):
+            p = re.escape(f"{prefix}:{name}")
+            m = (re.search(p + r'\s*=\s*["\']\s*([^"\'<\s]+)\s*["\']', xmp)
+                 or re.search("<" + p + r">\s*([^<\s]+)\s*</" + p + ">", xmp))
+            return m.group(1) if m else None
+        part = value("part")
+        if part and part.isdigit():
+            conformance = value("conformance")
+            return {"part": int(part), "conformance": conformance.upper() if conformance else None}
+    return None
+
+
+def pdfa_label(info):
+    """"1B", "2U", "3"... para el informe; None si no es PDF/A."""
+    return None if info is None else f"{info['part']}{info['conformance'] or ''}"
 
 
 def _has_content(page):
@@ -53,9 +108,22 @@ def verify(input_path, output_path):
     return None
 
 
+def info(input_path, report_path):
+    doc = pymupdf.open(input_path)
+    if needs_password(doc):
+        print("PDF con contraseña de apertura", file=sys.stderr)
+        return EXIT_ENCRYPTED
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump({"signed": signed(doc), "pdfa": pdfa_label(pdfa(doc))}, f)
+    return 0
+
+
 def main(argv):
+    if len(argv) == 4 and argv[1] == "info":
+        return info(argv[2], argv[3])
     if len(argv) != 4 or argv[1] != "verify":
-        print("Uso: python3 pdf_check.py verify <entrada.pdf> <salida.pdf>", file=sys.stderr)
+        print("Uso: python3 pdf_check.py verify <entrada.pdf> <salida.pdf>\n"
+              "     python3 pdf_check.py info <entrada.pdf> <informe.json>", file=sys.stderr)
         return 2
     try:
         problem = verify(argv[2], argv[3])
