@@ -538,7 +538,7 @@ class LineaDeComandos(unittest.TestCase):
 
 
 class Perfil(unittest.TestCase):
-    """Motivos de perfil.py (docs/estudio-comprimir-nivel-bajo.md, punto 4)."""
+    """Motivos de perfil.py (aviso de «no se puede comprimir más»)."""
 
     def hint(self, path):
         with pymupdf.open(path) as doc:

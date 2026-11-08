@@ -23,6 +23,7 @@ ninguna imagen). Está escrito en Python sobre
 | `pdf_check.py` | `info` | Dice si el PDF lleva una firma electrónica y si declara PDF/A. |
 | `lossless_clean.py` | (limpieza) | Comprime sin pérdida: capa Flate en los JPEG, subconjunto de las fuentes TrueType completas, objetos sin usar y repetidos fuera, Flate y flujos de objetos. No recodifica ni reduce ninguna imagen ni toca el contenido de las páginas. Respeta PDF/A. |
 | `perfil.py` | (perfil) | Reparte el peso del PDF (imágenes protegidas, JPEG, otras imágenes, fuentes) y da el motivo por el que no se puede comprimir más. |
+| `pdf_a_word.py` | (PDF a Word) | Desde la 1.4.0. Convierte un escrito de texto a Word (.docx) con [pdf2docx](https://pypi.org/project/pdf2docx/0.5.13/) y un posprocesado propio (`posproceso.py`): una sola sección, cabecera y pie reales con el número de página como campo, párrafos que fluyen, sangrías, notas al pie y listas de Word reales. Rechaza con un motivo lo que no sabe convertir bien (escaneos sin texto, formularios, páginas giradas, dibujos, varias columnas). |
 
 Cada comando es un proceso independiente: no usa la red, no guarda estado entre
 ejecuciones y solo lee y escribe las rutas que recibe como argumentos.
@@ -33,6 +34,10 @@ ejecuciones y solo lee y escribe las rutas que recibe como argumentos.
   3.10 o posterior).
 - Las dependencias de [`requirements.txt`](requirements.txt), con versiones exactas:
   PyMuPDF 1.28.2 y Pillow 12.3.0.
+- Solo para `pdf_a_word.py`: las de [`requirements-word.txt`](requirements-word.txt), con
+  versiones exactas y todas escritas (pdf2docx y lo que necesita), que se instalan con
+  `pip install --no-deps -r requirements-word.txt`: pdf2docx pide además OpenCV y fire, que no
+  se usan (OpenCV lo sustituye [`sin_opencv/cv2.py`](sin_opencv/cv2.py), un módulo vacío).
 - Solo para la cadena de compresión y parte de los tests: Ghostscript (`gs`).
 - Solo para los tests: [`requirements-test.txt`](requirements-test.txt) (añade zxing-cpp,
   que genera y decodifica los QR y códigos de barras de prueba).
@@ -45,6 +50,7 @@ ejecuciones y solo lee y escribe las rutas que recibe como argumentos.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+pip install --no-deps -r requirements-word.txt   # solo para pdf_a_word.py
 
 python3 redact.py search entrada.pdf patrones.json hallazgos.json
 ```
@@ -53,7 +59,7 @@ Tests:
 
 ```bash
 pip install -r requirements-test.txt
-python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py
+python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py
 ```
 
 Las pruebas que comprimen de verdad necesitan Ghostscript. Las de la clase
@@ -117,11 +123,13 @@ Reglas comunes:
 | 3 | El PDF de entrada tiene contraseña de apertura: no se ha procesado. |
 | 4 | Según el comando: `search`, patrones no válidos; `jpeg_flate.py`, no se han podido restaurar las imágenes protegidas; `verify`, la salida no es válida. |
 
+`pdf_a_word.py` sale con 0 también cuando no convierte: lo dice su informe (`refused`).
+
 ### Variables de entorno
 
 | Variable | Comando | Significado |
 |---|---|---|
-| `MOTOR_MAX_JOBS` | `apply` | Desde la versión 1.2.0. Cuántos trabajos pueden correr a la vez en la misma máquina o contenedor (entero ≥ 1; por defecto, 1). Reparte la memoria entre ellos en el aviso previo `SHARED_IMAGE_TOO_LARGE`. |
+| `MOTOR_MAX_JOBS` | `apply`, `pdf_a_word.py` | Desde la versión 1.2.0 (`pdf_a_word.py`, desde la 1.4.0: su límite de memoria). Cuántos trabajos pueden correr a la vez en la misma máquina o contenedor (entero ≥ 1; por defecto, 1). Reparte la memoria entre ellos en el aviso previo `SHARED_IMAGE_TOO_LARGE`. |
 
 ### Coordenadas
 
@@ -436,6 +444,64 @@ Desde la versión 1.3.0.
   No predice si un PDF se puede comprimir: solo describe de qué está hecho.
 - Salida: 0; 1; 2; 3.
 
+### `pdf_a_word.py ENTRADA SALIDA INFORME [--max-paginas=N] [--sin-listas-word]`
+
+Desde la versión 1.4.0.
+
+- `ENTRADA`: PDF. `SALIDA` (escribe): el `.docx`, solo si convierte. `--max-paginas`: páginas
+  como mucho (por defecto, 300).
+- Listas: por defecto, las viñetas y los números de lista del PDF pasan a listas de Word
+  (numeración de Word, que se renumera al editar), con la fuente y el tamaño de la etiqueta del
+  PDF. Una lista que no se puede convertir entera (una etiqueta que no se sabe representar, un
+  elemento sin sangría reconocida) se queda con las etiquetas escritas y un tabulador, sin
+  listas a medias. Con `--sin-listas-word`, todas se quedan así.
+- `INFORME` (escribe): solo recuentos, nunca texto del documento. Si convierte:
+  `{"pages", "ocr", "ocr_pages", "ocr_words", "ocr_words_missing", "ocr_lines",
+  "ocr_lines_missing", "header", "first_page_header", "footer", "page_fields", "notes_pdf",
+  "notes", "fake_tables", "lists", "list_items", "lists_not_converted"}` (`ocr` y los `ocr_*`:
+  ver abajo;
+  `header`/`first_page_header`/`footer`: si hay cabecera, cabecera solo de la primera página y
+  pie reales; `page_fields`: campos de número de página; `notes_pdf`/`notes`: notas al pie del
+  PDF y cuántas han pasado a notas de Word; `fake_tables`: líneas que pdf2docx había convertido
+  en tabla y vuelven a ser texto; `lists`/`list_items`: listas de Word y sus elementos;
+  `lists_not_converted`: listas que se quedan escritas; los tres a 0 con `--sin-listas-word`).
+  Si no:
+  `{"refused": CÓDIGO, "reason": MOTIVO, ...}`, sin `SALIDA`:
+
+  | `refused` | `reason` | Cuándo |
+  |---|---|---|
+  | `PDF_TOO_LARGE` | `pages` | Más de `--max-paginas` páginas (con `pages` y `max_pages`). |
+  | `PDF_TOO_LARGE` | `memory` | La conversión pasa de la memoria de un trabajo (con `max_memory`). |
+  | `PDF_NO_TEXT` | `scanned` | Ninguna página tiene texto, ni visible ni de un OCR. |
+  | `PDF_MIXED_SCAN` | `hidden_text` | Una página con texto visible tiene además texto invisible sin un escaneo debajo: no se sabe qué es ni si saldría entero. |
+  | `PDF_MIXED_SCAN` | `ocr_text` | PDF con páginas de texto y páginas escaneadas con OCR al que, convertido, le faltaría texto del OCR (con los recuentos `ocr_*`). |
+  | `PDF_UNSUPPORTED` | `ocr_text` | Lo mismo, con todas las páginas escaneadas. |
+  | `PDF_UNSUPPORTED` | `form` | Tiene campos de formulario. |
+  | `PDF_UNSUPPORTED` | `rotated` | Alguna página con `/Rotate` o con más del 10 % de su texto visible girado. |
+  | `PDF_UNSUPPORTED` | `images` | pdf2docx necesitaría OpenCV (dibujos vectoriales, imágenes giradas). |
+  | `PDF_UNSUPPORTED` | `layout` | pdf2docx no da una sección por página (por ejemplo, con varias columnas): sin el posprocesado, el `.docx` no se puede editar bien. |
+
+- Texto de un OCR: pdf2docx no lee el texto invisible, que es como deja un OCR su capa de
+  texto sobre el escaneo. Una página escaneada con OCR es una con texto invisible y sin texto
+  visible, o con los dos sobre una imagen que tapa al menos la mitad de la página (el sello visible
+  de una sede electrónica sobre el escaneo). Si hay alguna, también en un PDF que mezcla páginas de
+  texto y escaneadas, convierte una copia (`SALIDA.ocr.pdf`, que borra siempre) en la que esas páginas
+  no tienen imágenes y su texto es visible: queda el texto, sin el escaneo (ni firmas ni sellos),
+  `ocr` es `true` y `ocr_pages` dice cuántas. Después comprueba que todo el texto de esas páginas
+  está en el `.docx`: cada palabra distinta (de dos caracteres o más) y cada línea (de cuatro letras
+  o más, seguida y sin cifras), sin espacios ni signos. Si falta algo (`ocr_words_missing` u
+  `ocr_lines_missing`), no entrega nada: `PDF_MIXED_SCAN` o `PDF_UNSUPPORTED` `ocr_text`.
+- Memoria: límite de memoria virtual del proceso (`RLIMIT_AS`) = 0,7 × la del contenedor (cgroup
+  v2 o v1; sin límite, la RAM) ÷ `MOTOR_MAX_JOBS`, el mismo reparto que el aviso previo de
+  `apply`. Si se agota, `PDF_TOO_LARGE` `memory`.
+- Datos: además de `SALIDA` e `INFORME`, solo escribe sus copias de trabajo junto a `SALIDA`
+  (`SALIDA.pdf2docx.docx`, `SALIDA.ocr.pdf`, `SALIDA.fuentes`), que borra siempre (salvo si se le
+  mata). No escribe en stdout; en stderr, solo mensajes fijos (el tipo de la excepción, nunca su
+  texto ni el del PDF, que pdf2docx y MuPDF sí escriben en sus avisos: van a `/dev/null`).
+- Salida: 0 (convertido o rechazado); 1; 2 (también con una opción desconocida); 3.
+- Tests: `pdf_a_word_test.py` y `posproceso_test.py`. Los que usan el banco sintético del estudio
+  (`../pruebas-pdf/pdf-a-word`, en el repositorio de la API) se saltan sin él.
+
 ## Cadena de compresión
 
 Comprimir un PDF con pérdida (reduciendo y recodificando imágenes) sin estropear sus códigos
@@ -556,6 +622,12 @@ todos, la entrada sin tocar.
 | [Pillow](https://pypi.org/project/pillow/12.3.0/) | 12.3.0 | MIT-CMU | Recodificar las imágenes censuradas y leer la calidad de los JPEG (perfil). |
 | [zxing-cpp](https://pypi.org/project/zxing-cpp/3.1.1/) | 3.1.1 | Apache-2.0 | Solo tests. |
 | Ghostscript | la del sistema | AGPL-3.0-or-later | Compresor externo de la cadena de compresión (programa aparte, por línea de comandos). |
+| [pdf2docx](https://pypi.org/project/pdf2docx/0.5.13/) | 0.5.13 | MIT | `pdf_a_word.py`. Sin OpenCV ni fire, que pide pero no se usan (ver Requisitos). |
+| [python-docx](https://pypi.org/project/python-docx/1.2.0/) | 1.2.0 | MIT | `pdf_a_word.py` y `posproceso.py`. |
+| [lxml](https://pypi.org/project/lxml/6.1.3/) | 6.1.3 | BSD-3-Clause (la rueda lleva libxml2 2.14.6 y libxslt 1.1.43, MIT) | Dependencia de python-docx. |
+| [fontTools](https://pypi.org/project/fonttools/4.68.0/) | 4.68.0 | MIT | Dependencia de pdf2docx. |
+| [NumPy](https://pypi.org/project/numpy/2.5.4/) | 2.5.4 | BSD-3-Clause, 0BSD, MIT, Zlib y CC0-1.0 (la rueda lleva OpenBLAS, BSD-3-Clause; libgfortran, GPL-3.0-or-later con la excepción de bibliotecas de GCC 3.1; y libquadmath, LGPL-2.1-or-later) | Dependencia de pdf2docx. |
+| [typing_extensions](https://pypi.org/project/typing-extensions/4.16.0/) | 4.16.0 | PSF-2.0 | Dependencia de python-docx. |
 
 ## Código fuente de las bibliotecas
 

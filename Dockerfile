@@ -23,9 +23,11 @@ ENV PATH="/opt/venv/bin:$PATH" \
 RUN python3 -m venv /opt/venv
 
 WORKDIR /motor
-COPY requirements.txt ./
-RUN pip install -r requirements.txt
+COPY requirements.txt requirements-word.txt ./
+RUN pip install -r requirements.txt \
+    && pip install --no-deps -r requirements-word.txt
 COPY LICENSE README.md VERSION *.py ./
+COPY sin_opencv ./sin_opencv
 
 ENTRYPOINT ["python3"]
 
@@ -33,7 +35,7 @@ ENTRYPOINT ["python3"]
 FROM motor AS tests
 COPY requirements-test.txt ./
 RUN pip install -r requirements-test.txt
-RUN python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py \
+RUN python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py \
     && touch /tmp/tests-ok
 
 # Imagen final: la de "motor", solo si los tests han pasado

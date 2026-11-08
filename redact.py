@@ -692,7 +692,7 @@ def _few_colors(img):
 
     getcolors(N) devuelve None en cuanto pasa de N y no sigue contando. Antes,
     Pixmap.color_count() contaba todos: 2,2-2,5 s por foto de página entera a 300 ppp, el 84 %
-    de apply con un fondo fotográfico (docs/estudio-anonimizar-tamano.md). Misma decisión.
+    de apply con un fondo fotográfico (banco de PDF sintéticos). Misma decisión.
     """
     return img.getcolors(MAX_LOSSLESS_COLORS) is not None
 
@@ -3191,7 +3191,7 @@ def zones_not_black(page, zones):
     """¿Alguna zona que toca una imagen no se ve negra? Solo en las páginas donde una zona
     toca una imagen: en el texto ya mira la geometría chars_in_zones, pero los píxeles de una
     imagen no se pueden buscar. (Con /Rotate y la CropBox desplazada, el negro llegó a salir
-    lejos de su zona: fix/censura-rotate-cropbox, 2026-10-17.)
+    lejos de su zona; corregido el 2026-10-17.)
 
     Página entera a RENDER_DPI en gris, con /Rotate 0 (sin las matrices de PyMuPDF que fallan
     con rotación, ver paint_rects): cada zona, recortada a lo visible y reducida 1 px, debe
@@ -3668,7 +3668,7 @@ def item_zone(doc, item):
 # Aviso previo con imágenes compartidas (decisión del 2026-10-27). apply_redactions deja en
 # cada página censurada que usa una imagen compartida su propia copia entera de la imagen: con
 # un fondo de página común a muchas páginas, la salida se multiplica (×80 con 120 páginas en
-# docs/estudio-anonimizar-tamano.md). Antes de censurar se estima la salida, el tiempo y la
+# un banco de PDF sintéticos). Antes de censurar se estima la salida, el tiempo y la
 # memoria de esas copias y, si pasan de estos límites, apply no censura nada y server.js
 # responde 422 SHARED_IMAGE_TOO_LARGE (en vez de acabar en un 504 tras el tope).
 SHARED_REFUSAL = "SHARED_IMAGE_TOO_LARGE"
@@ -3709,7 +3709,7 @@ SHARED_MEMORY_FACTOR = 8.2
 # Segundos de la contención (sección 4b) por página que usa una imagen compartida y megapíxel de
 # sus zonas (las máscaras de lo que no muestra cada página): medido con 11_form_compartido del
 # banco (120 págs., foto de 4000 × 2160, zonas en todas): +5,7 s en local frente a la rama base,
-# 0,0055 s, por 1,3 de producción (2026-10-28, fix/anonimizar-imagen-compartida).
+# 0,0055 s, por 1,3 de producción (2026-10-28).
 SHARED_PAGE_SECONDS_PER_MPX = 0.007
 # Límite de memoria por trabajo: el 70 % de la memoria del contenedor (su mem_limit, leído del
 # cgroup) entre los trabajos que la API deja correr a la vez, que server.js pasa en
@@ -4082,7 +4082,7 @@ def apply(input_path, output_path, items):
     })
 
     # use_objstms: los objetos que no son flujos van en flujos de objetos comprimidos (-0 a -8 %,
-    # sin coste de tiempo; docs/estudio-anonimizar-tamano.md). La salida no conserva PDF/A
+    # sin coste de tiempo, en un banco de PDF sintéticos). La salida no conserva PDF/A
     # (scrub quita el XMP): no hay que respetar la restricción de PDF/A-1.
     doc.save(output_path, garbage=4, deflate=True, clean=True, use_objstms=1)
     doc.close()

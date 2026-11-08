@@ -116,7 +116,7 @@ def _few_colors(pix):
     """¿Tiene pix (sin alfa) MAX_COLORS colores distintos o menos?
 
     Pillow getcolors(N) devuelve None en cuanto pasa de N y no sigue contando (el mismo
-    método que el conteo de Anonimizar en a86af52, rama perf/anonimizar-colores). Antes,
+    método que el conteo de colores de Anonimizar, _few_colors de redact.py). Antes,
     Pixmap.color_count() contaba todos los de una foto o un escaneo en Flate. Misma decisión
     (test ConteoDeColores). Otro número de componentes (DeviceN, Lab...), que Pillow no tiene:
     color_count, como antes."""

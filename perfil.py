@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Blanca Molina Rojas (PDFcadabra)
-"""Perfil de un PDF para el aviso de «no se puede comprimir más» (docs/estudio-comprimir-nivel-bajo.md,
-punto 4). No predice si Comprimir lo va a reducir: eso lo dice el resultado (ahorro < 2 % ->
+"""Perfil de un PDF para el aviso de «no se puede comprimir más». No predice si Comprimir lo va a reducir: eso lo dice el resultado (ahorro < 2 % ->
 se devuelve el original). Solo elige el motivo (`hint`) con el que la web escoge el texto.
 
 Reparto de los bytes de los flujos tal como están en el archivo (fracción del tamaño total):

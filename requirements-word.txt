@@ -1,0 +1,12 @@
+# PDF a Word (pdf_a_word.py; apagado en la API salvo PDF_TO_WORD_ENABLED=1).
+# Versiones exactas, con TODAS las dependencias escritas aquí: se instala con
+#   pip install --no-deps -r requirements-word.txt
+# porque pdf2docx pide además opencv-python-headless (153 MB, con FFmpeg y OpenSSL 1.1.1k dentro)
+# y fire (su línea de comandos), que no se usan: OpenCV lo sustituye sin_opencv/cv2.py.
+# PyMuPDF ya está en requirements.txt. Licencias: README.md («Dependencias y licencias»).
+pdf2docx==0.5.13
+python-docx==1.2.0
+lxml==6.1.3
+fonttools==4.68.0
+numpy==2.5.4
+typing_extensions==4.16.0
