@@ -25,8 +25,9 @@ import zipfile
 import pymupdf
 
 import pdf_a_word
+import pdf_check
 
-AQUI = os.path.dirname(os.path.abspath(__file__))
+AQUI =os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(AQUI, "pdf_a_word.py")
 BANCO = os.path.join(AQUI, "..", "pruebas-pdf", "pdf-a-word")
 # Los del banco con listas: esperado.json es sin listas de Word.
@@ -453,6 +454,298 @@ class TextoDeOcr(Base):
         self.assertIn("la parte actora interesa", texto_docx(self.ruta("salida.docx")))
         with zipfile.ZipFile(self.ruta("salida.docx")) as z:
             self.assertFalse([n for n in z.namelist() if n.startswith("word/media/")])
+
+
+FIRMA_VISIBLE = "Firmado digitalmente por Persona Ficticia"
+
+
+def firmar(pdf, firmada=True, visible=False):
+    """Añade a la primera página de `pdf` un campo de firma (/FT /Sig): con la estructura de PAdES
+    (el contenido CMS es de relleno) o vacío, y con apariencia de texto si es visible."""
+    doc = pymupdf.open(pdf)
+    page = doc[0]
+    campo = doc.get_new_xref()
+    extra = ""
+    if firmada:
+        sig = doc.get_new_xref()
+        doc.update_object(sig, "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached "
+                               f"/ByteRange [0 1000 9000 500] /Contents <{'00' * 400}> >>")
+        extra += f" /V {sig} 0 R"
+    rect = "[0 0 0 0]"
+    if visible:
+        ap = doc.get_new_xref()
+        doc.update_object(ap, "<< /Type /XObject /Subtype /Form /BBox [0 0 240 50] /Resources << /Font << /F1 "
+                              "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>")
+        doc.update_stream(ap, f"BT /F1 9 Tf 4 30 Td ({FIRMA_VISIBLE}) Tj ET".encode())
+        rect = "[300 60 540 110]"
+        extra += f" /AP << /N {ap} 0 R >>"
+    doc.update_object(campo, f"<< /FT /Sig /T (Firma1) /Type /Annot /Subtype /Widget /Rect {rect} /F 132 "
+                             f"/P {page.xref} 0 R{extra} >>")
+    anteriores = " ".join(f"{x[0]} 0 R" for x in page.annot_xrefs())
+    doc.xref_set_key(page.xref, "Annots", f"[{anteriores} {campo} 0 R]")
+    catalogo = doc.pdf_catalog()
+    kind, campos = doc.xref_get_key(catalogo, "AcroForm/Fields")
+    if kind == "null":
+        doc.xref_set_key(catalogo, "AcroForm", f"<< /Fields [{campo} 0 R] /SigFlags 3 >>")
+    else:
+        doc.xref_set_key(catalogo, "AcroForm/Fields", campos[:-1] + f" {campo} 0 R]")
+    doc.saveIncr()
+    doc.close()
+
+
+def campo_de_texto(pdf):
+    doc = pymupdf.open(pdf)
+    w = pymupdf.Widget()
+    w.field_type = pymupdf.PDF_WIDGET_TYPE_TEXT
+    w.field_name = "nombre"
+    w.rect = pymupdf.Rect(72, 720, 300, 740)
+    doc[0].add_widget(w)
+    doc.saveIncr()
+    doc.close()
+
+
+class CamposDeFirma(Base):
+    """Un PDF cuyos únicos campos son de firma es un escrito firmado, no un formulario (antes,
+    422 form: doc.is_form_pdf cuenta también los de firma)."""
+
+    def convierte(self, pdf):
+        codigo, rep, salida, quedan = self.convertir(pdf)
+        self.assertEqual((codigo, salida), (0, ""))
+        self.assertEqual(quedan, ["informe.json", "salida.docx"])  # la copia de trabajo, borrada
+        self.assertNotIn("refused", rep)
+        return texto_docx(self.ruta("salida.docx"))
+
+    def test_firmado(self):
+        pdf = self.ruta("firmado.pdf")
+        escrito(pdf, paginas=1)
+        firmar(pdf)
+        self.assertIn("la parte actora interesa", self.convierte(pdf))
+
+    def test_campo_de_firma_vacio(self):
+        pdf = self.ruta("vacio.pdf")
+        escrito(pdf, paginas=1)
+        firmar(pdf, firmada=False)
+        self.assertIn("la parte actora interesa", self.convierte(pdf))
+
+    def test_el_texto_de_una_firma_visible_queda_en_el_word(self):
+        pdf = self.ruta("visible.pdf")
+        escrito(pdf, paginas=1)
+        firmar(pdf, visible=True)
+        xml = self.convierte(pdf)
+        self.assertIn(FIRMA_VISIBLE, xml)
+        self.assertIn("la parte actora interesa", xml)
+
+    def test_formulario_y_firma_se_rechaza(self):
+        pdf = self.ruta("mezcla.pdf")
+        escrito(pdf, paginas=1)
+        campo_de_texto(pdf)
+        firmar(pdf)
+        _, rep, _, quedan = self.convertir(pdf)
+        self.assertEqual(rep, {"refused": "PDF_UNSUPPORTED", "reason": "form"})
+        self.assertEqual(quedan, ["informe.json"])
+
+    def test_widget_que_no_es_firma_fuera_de_fields_se_rechaza(self):
+        pdf = self.ruta("huerfano.pdf")
+        escrito(pdf, paginas=1)
+        firmar(pdf)
+        doc = pymupdf.open(pdf)
+        suelto = doc.get_new_xref()
+        doc.update_object(suelto, f"<< /FT /Tx /T (x) /Type /Annot /Subtype /Widget /Rect [72 720 300 740] /P {doc[0].xref} 0 R >>")
+        anteriores = " ".join(f"{x[0]} 0 R" for x in doc[0].annot_xrefs())
+        doc.xref_set_key(doc[0].xref, "Annots", f"[{anteriores} {suelto} 0 R]")
+        doc.saveIncr()
+        doc.close()
+        self.assertEqual(self.convertir(pdf)[1], {"refused": "PDF_UNSUPPORTED", "reason": "form"})
+
+    def test_tipo_heredado_del_padre(self):
+        doc = pymupdf.open()
+        doc.new_page()
+        padre, hijo = doc.get_new_xref(), doc.get_new_xref()
+        doc.update_object(padre, f"<< /FT /Sig /T (Firma) /Kids [{hijo} 0 R] >>")
+        doc.update_object(hijo, f"<< /Parent {padre} 0 R /Type /Annot /Subtype /Widget /Rect [0 0 0 0] >>")
+        doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields [{padre} 0 R] >>")
+        self.assertTrue(pdf_a_word.only_signature_fields(doc))
+        doc.update_object(padre, f"<< /FT /Tx /T (Nombre) /Kids [{hijo} 0 R] >>")
+        self.assertFalse(pdf_a_word.only_signature_fields(doc))
+
+    def test_xfa_no_se_da_por_firmado(self):
+        doc = pymupdf.open()
+        doc.new_page()
+        campo = doc.get_new_xref()
+        doc.update_object(campo, "<< /FT /Sig /T (Firma) >>")
+        doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields [{campo} 0 R] /XFA [(a) 1 0 R] >>")
+        self.assertFalse(pdf_a_word.only_signature_fields(doc))
+
+    @unittest.skipUnless(os.path.isdir(BANCO), "sin pruebas-pdf/pdf-a-word (motor solo)")
+    def test_fixture_firmado_de_la_web(self):
+        self.assertIn("juicio ordinario 123/2026", self.convierte(os.path.join(BANCO, "x03-firmado-pdf-lib.pdf")))
+
+
+@unittest.skipUnless(os.path.isdir(BANCO), "sin pruebas-pdf/pdf-a-word (motor solo)")
+class FirmasPadesReales(Base):
+    """PAdES de verdad (x04 a x07: pyHanko, certificado de prueba autofirmado; ver el README del banco)."""
+
+    TEXTO_FIRMA = "firmadodigitalmenteporpersonaficticiadeprueba"
+
+    def test_se_convierten_con_el_texto_de_las_firmas_visibles(self):
+        for nombre, firmas, visibles in (("x04-pades-visible", 1, 1), ("x05-pades-invisible", 1, 0),
+                                         ("x06-pades-dos-firmas", 2, 2)):
+            with self.subTest(nombre):
+                pdf = os.path.join(BANCO, nombre + ".pdf")
+                with pymupdf.open(pdf) as doc:
+                    self.assertTrue(pdf_check.signed(doc))
+                    self.assertEqual(doc.is_form_pdf, firmas)
+                codigo, rep, salida, quedan = self.convertir(pdf)
+                self.assertEqual((codigo, salida), (0, ""))
+                self.assertEqual(quedan, ["informe.json", "salida.docx"])
+                self.assertNotIn("refused", rep)
+                self.assertFalse(rep["ocr"])
+                texto = pdf_a_word.docx_text(self.ruta("salida.docx"))
+                self.assertIn("aljuzgadodeprimerainstanciadevillaficticia", texto)
+                self.assertEqual(texto.count(self.TEXTO_FIRMA), visibles)
+                # La última línea de la estampa cae en el 10 % inferior de la página, pero sigue en
+                # su párrafo del cuerpo: no se repite en el pie.
+                self.assertEqual(texto.count("fecha2026"), visibles)
+                self.assertFalse(rep["footer"])
+                os.unlink(self.ruta("salida.docx"))
+                os.unlink(self.ruta("informe.json"))
+
+    def test_formulario_real_con_firma_se_rechaza(self):
+        pdf = os.path.join(BANCO, "x07-formulario-pades.pdf")
+        with pymupdf.open(pdf) as doc:
+            self.assertTrue(pdf_check.signed(doc))
+        codigo, rep, salida, quedan = self.convertir(pdf)
+        self.assertEqual(codigo, 0, salida)
+        self.assertEqual(rep, {"refused": "PDF_UNSUPPORTED", "reason": "form"})
+        self.assertEqual(quedan, ["informe.json"])
+
+
+class PaginasConPocoTexto(Base):
+    """Una página con muy poco texto arriba no es un membrete: se quedaba sin cuerpo y el
+    posprocesado fallaba (500)."""
+
+    def test_fixture_mixto_con_el_ocr_de_la_web(self):
+        if not os.path.isdir(BANCO):
+            self.skipTest("sin pruebas-pdf/pdf-a-word (motor solo)")
+        codigo, rep, salida, quedan = self.convertir(os.path.join(BANCO, "x02-mixto-ocr-web.pdf"))
+        self.assertEqual((codigo, salida), (0, ""))
+        self.assertEqual(quedan, ["informe.json", "salida.docx"])
+        self.assertEqual((rep["ocr"], rep["ocr_pages"]), (True, 1))
+        self.assertEqual((rep["ocr_words_missing"], rep["ocr_lines_missing"]), (0, 0))
+        self.assertFalse(rep["first_page_header"])
+        xml = texto_docx(self.ruta("salida.docx"))
+        self.assertIn("Pagina de texto con la palabra manzana1.", xml)
+        self.assertIn("juicio ordinario 123/2026", xml)
+
+    def test_linea_corta_antes_de_una_pagina_que_empieza_mas_abajo(self):
+        doc = pymupdf.open()
+        p = doc.new_page(width=595, height=842)
+        p.insert_text((72, 70), "Una sola linea arriba del todo.", fontsize=12)
+        p = doc.new_page(width=595, height=842)
+        p.insert_textbox(pymupdf.Rect(72, 150, 523, 600), PARRAFO * 4, fontsize=12, align=3)
+        pdf = self.ruta("corta.pdf")
+        doc.save(pdf)
+        codigo, rep, salida, _ = self.convertir(pdf)
+        self.assertEqual((codigo, salida), (0, ""))
+        self.assertFalse(rep["first_page_header"])
+        self.assertIn("Una sola linea arriba del todo.", texto_docx(self.ruta("salida.docx")))
+
+    def test_una_pagina_con_una_sola_linea_arriba(self):
+        doc = pymupdf.open()
+        doc.new_page(width=595, height=842).insert_text((72, 65), "Una sola linea arriba del todo.", fontsize=12)
+        pdf = self.ruta("linea.pdf")
+        doc.save(pdf)
+        codigo, rep, salida, _ = self.convertir(pdf)
+        self.assertEqual((codigo, salida), (0, ""))
+        self.assertNotIn("refused", rep)
+        self.assertIn("Una sola linea arriba del todo.", texto_docx(self.ruta("salida.docx")))
+
+
+class FalloDelPosprocesado(Base):
+    """Red de seguridad: lo inesperado en el posprocesado es un 422 sin datos, no un 500; la
+    falta de memoria o de disco sigue siendo un fallo del servicio."""
+
+    def falla_con(self, error):
+        import posproceso
+        real = posproceso.posprocesar
+
+        def rota(pdf, docx_in, docx_out, **kw):
+            with open(docx_out, "wb") as f:
+                f.write(b"a medias")
+            raise error
+
+        posproceso.posprocesar = rota
+        self.addCleanup(setattr, posproceso, "posprocesar", real)
+        pdf = self.ruta("e.pdf")
+        escrito(pdf, paginas=1)
+        return pdf, self.ruta("s.docx")
+
+    def test_error_inesperado_es_un_rechazo_sin_datos(self):
+        pdf, salida = self.falla_con(ValueError(MARCA))
+        with self.assertRaises(pdf_a_word.Refused) as r:
+            pdf_a_word.convert(pdf, salida, 300)
+        self.assertEqual(r.exception.report, {"refused": "PDF_UNSUPPORTED", "reason": "layout", "error_type": "ValueError"})
+        self.assertNotIn("Zarzaparrilla", json.dumps(r.exception.report))
+        self.assertEqual(sorted(os.listdir(self.dir)), ["e.pdf"])
+
+    def test_sin_memoria_o_sin_disco_no_se_disfraza(self):
+        for error in (MemoryError(), OSError(28, "No space left on device")):
+            with self.subTest(type(error).__name__):
+                pdf, salida = self.falla_con(error)
+                with self.assertRaises(type(error)):
+                    pdf_a_word.convert(pdf, salida, 300)
+
+
+class FormaDeLaPagina(Base):
+    def lista_numerada(self, separacion):
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_textbox(pymupdf.Rect(72, 90, 523, 300), PARRAFO * 2, fontsize=12, align=3)
+        for i, texto in enumerate(("Primer punto", "Segundo punto", "Tercer punto")):
+            y = 340 + 18 * i
+            etiqueta = f"{i + 1}."
+            page.insert_text((90, y), etiqueta, fontsize=12)
+            x = 90 + pymupdf.get_text_length(etiqueta, fontsize=12) + separacion
+            page.insert_text((x, y), texto, fontsize=12)
+        return doc
+
+    def test_numero_con_hueco_es_lista_de_word(self):
+        doc = self.lista_numerada(9)
+        pdf = self.ruta("n.pdf")
+        doc.save(pdf)
+        codigo, rep, salida, _ = self.convertir(pdf)
+        self.assertEqual((codigo, salida), (0, ""))
+        self.assertEqual((rep["lists"], rep["list_items"]), (1, 3))
+        xml = texto_docx(self.ruta("salida.docx"))
+        self.assertEqual(xml.count("<w:numPr>"), 3)
+        self.assertNotIn("1.Primer", xml)
+
+    def test_numero_con_un_espacio_normal_no_es_lista(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_textbox(pymupdf.Rect(72, 90, 523, 300), PARRAFO * 2, fontsize=12, align=3)
+        page.insert_text((72, 340), "3. Que se tenga por presentado este escrito.", fontsize=12)
+        pdf = self.ruta("t.pdf")
+        doc.save(pdf)
+        codigo, rep, _, _ = self.convertir(pdf)
+        self.assertEqual((codigo, rep["lists"]), (0, 0))
+        self.assertIn("3. Que se tenga", texto_docx(self.ruta("salida.docx")))
+
+    def paginas(self, parrafos):
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        self.assertGreater(page.insert_textbox(pymupdf.Rect(72, 90, 523, 770), PARRAFO * parrafos, fontsize=12, align=3), 0)
+        doc.new_page(width=595, height=842).insert_textbox(pymupdf.Rect(72, 90, 523, 500), "SEGUNDA PARTE. " + PARRAFO * 3, fontsize=12, align=3)
+        pdf = self.ruta("p.pdf")
+        doc.save(pdf)
+        self.assertEqual(self.convertir(pdf)[0], 0)
+        return texto_docx(self.ruta("salida.docx")).count("pageBreakBefore")
+
+    def test_pagina_que_acaba_muy_pronto_da_salto(self):
+        self.assertEqual(self.paginas(6), 1)
+
+    def test_pagina_llena_no_da_salto(self):
+        self.assertEqual(self.paginas(19), 0)
 
 
 if __name__ == "__main__":

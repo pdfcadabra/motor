@@ -21,7 +21,7 @@ o, si no convierte (sin escribir SALIDA), {"refused": CÓDIGO, "reason": MOTIVO,
   PDF_TOO_LARGE    "pages" (más de --max-paginas: con "pages" y "max_pages") o "memory" (pasa
                    de la memoria de un trabajo; con "max_memory").
   PDF_NO_TEXT      "scanned": ninguna página tiene texto (ni visible ni de un OCR): escaneo.
-  PDF_UNSUPPORTED  "form" (campos de formulario), "rotated" (páginas o texto girados), "images"
+  PDF_UNSUPPORTED  "form" (campos de formulario que no son de firma), "rotated" (páginas o texto girados), "images"
                    (pdf2docx necesitaría OpenCV: dibujos vectoriales o imágenes giradas) o
                    "layout" (pdf2docx no ha dado una sección por página: sin posprocesado el
                    .docx no se puede editar bien, y no se entrega).
@@ -206,6 +206,73 @@ def image_share(page):
     return best
 
 
+PDF_REFS = re.compile(r"(\d+)\s+\d+\s+R")
+
+
+def _ref_array(doc, xref, key):
+    """Los números de objeto de un array de referencias (`key` de `xref`): [] si no está, None si
+    no es un array solo de referencias."""
+    kind, value = doc.xref_get_key(xref, key)
+    if kind == "null":
+        return []
+    if kind == "xref":
+        value = doc.xref_object(int(value.split()[0]), compressed=True)
+    elif kind != "array":
+        return None
+    value = value.strip()
+    if not (value.startswith("[") and value.endswith("]")) or PDF_REFS.sub("", value[1:-1]).strip():
+        return None
+    return [int(n) for n in PDF_REFS.findall(value)]
+
+
+def _field_type(doc, xref):
+    """/FT del campo o de la anotación `xref`, heredado de sus padres si no lo lleva (o None)."""
+    seen = set()
+    while xref not in seen:
+        seen.add(xref)
+        kind, value = doc.xref_get_key(xref, "FT")
+        if kind == "name":
+            return value
+        kind, value = doc.xref_get_key(xref, "Parent")
+        if kind != "xref":
+            return None
+        xref = int(value.split()[0])
+    return None
+
+
+def only_signature_fields(doc):
+    """True si todos los campos del formulario son de firma (/FT /Sig, firmados o vacíos): el PDF
+    es un escrito firmado y no un formulario. En la duda (XFA, estructura que no se entiende, o un
+    widget de otro tipo en alguna página aunque no esté en /Fields), False: se trata como formulario."""
+    try:
+        catalog = doc.pdf_catalog()
+        if doc.xref_get_key(catalog, "AcroForm/XFA")[0] != "null":
+            return False
+        pending = _ref_array(doc, catalog, "AcroForm/Fields")
+        if pending is None:
+            return False
+        seen = set()
+        while pending:
+            xref = pending.pop()
+            if xref in seen:
+                continue
+            seen.add(xref)
+            kids = _ref_array(doc, xref, "Kids")
+            if kids is None:
+                return False
+            if kids:
+                pending.extend(kids)
+            elif _field_type(doc, xref) != "/Sig":
+                return False
+        for page in doc:
+            for xref, kind, _ in page.annot_xrefs():
+                if kind == pymupdf.PDF_ANNOT_WIDGET and _field_type(doc, xref) != "/Sig":
+                    return False
+    except Exception:  # noqa: BLE001 - un PDF dañado no se da por firmado
+        return False
+    return True
+
+
 def check(doc, max_pages):
     """Rechazos antes de convertir. Devuelve las páginas escaneadas con OCR (las que se convierten
     desde la copia del OCR): las que tienen texto invisible y ninguno visible, y las que tienen los
@@ -215,7 +282,7 @@ def check(doc, max_pages):
     texto visible: PDF_MIXED_SCAN (no se sabe qué es ni si saldría entero)."""
     if doc.page_count > max_pages:
         raise Refused("PDF_TOO_LARGE", "pages", pages=doc.page_count, max_pages=max_pages)
-    if doc.is_form_pdf:
+    if doc.is_form_pdf and not only_signature_fields(doc):
         raise Refused("PDF_UNSUPPORTED", "form")
     total_visible = 0
     ocr_pages = set()
@@ -284,10 +351,14 @@ def missing_text(pdf_path, pages, docx_path):
 TR_INVISIBLE = re.compile(rb"(?<![\w.])3(\s+)Tr\b")
 
 
-def ocr_copy(src, ocr_pages, path):
+def ocr_copy(src, ocr_pages, path, flatten_widgets=False):
     """Copia del PDF en `path` en la que las páginas con OCR no tienen imágenes y su texto es
-    visible (modo 0). Así pdf2docx lo lee; el resto de cada página no cambia."""
+    visible (modo 0). Así pdf2docx lo lee; el resto de cada página no cambia. Con flatten_widgets,
+    además, la apariencia de los campos de firma pasa al contenido de la página: pdf2docx no lee los
+    widgets y el texto visible de una firma se perdería."""
     doc = pymupdf.open(src)
+    if flatten_widgets:
+        doc.bake(annots=False, widgets=True)
     for n in sorted(ocr_pages):
         page = doc[n]
         page.add_redact_annot(page.rect)
@@ -348,6 +419,7 @@ def convert(input_path, output_path, max_pages, lists=True):
         return None
     pages = doc.page_count
     ocr_pages = check(doc, max_pages)
+    signature_fields = bool(doc.is_form_pdf)  # tras check, solo pueden ser campos de firma
     doc.close()
 
     from cv2 import OpenCVNoDisponible
@@ -359,8 +431,8 @@ def convert(input_path, output_path, max_pages, lists=True):
     ocr_pdf = output_path + ".ocr.pdf"
     source = input_path
     try:
-        if ocr_pages:
-            ocr_copy(input_path, ocr_pages, ocr_pdf)
+        if ocr_pages or signature_fields:
+            ocr_copy(input_path, ocr_pages, ocr_pdf, flatten_widgets=signature_fields)
             source = ocr_pdf
         try:
             converter = Converter(source)
@@ -376,7 +448,16 @@ def convert(input_path, output_path, max_pages, lists=True):
         # pdf2docx guarda todas las páginas analizadas hasta escribir: se suelta antes del
         # posprocesado (40 págs.: pico de 186 MB en vez de 248).
         release_memory()
-        inf = posproceso.posprocesar(source, raw, output_path, listas=lists)
+        try:
+            inf = posproceso.posprocesar(source, raw, output_path, listas=lists)
+        except Exception as e:  # noqa: BLE001 - red de seguridad: lo inesperado no es un 500
+            # Sin memoria o sin disco sigue siendo un fallo del servicio, no del PDF. Al informe va
+            # solo el tipo de la excepción: nunca su texto, que puede llevar texto del documento.
+            if isinstance(e, OSError) or is_out_of_memory(e, max_memory()):
+                raise
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(output_path)
+            raise Refused("PDF_UNSUPPORTED", "layout", error_type=type(e).__name__) from None
         if inf.get("error"):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(output_path)

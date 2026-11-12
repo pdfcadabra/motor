@@ -169,6 +169,12 @@ def solo_cambia_la_pagina(occ, n):
     return True
 
 
+def pagina_corta(a, p):
+    """La página `p` acaba mucho antes del margen inferior (ver PAGINA_CORTA): se cortó a propósito."""
+    fin = a["fin_pagina"][p]
+    return fin is not None and fin < PAGINA_CORTA * a["h"]
+
+
 def analizar_pdf(ruta):
     doc = pymupdf.open(ruta)
     pags = lineas_pdf(doc)
@@ -212,6 +218,9 @@ def analizar_pdf(ruta):
                 zona[(p, i)] = "cab1"
             elif n == 1 and l["y0"] > h * 0.90:
                 zona[(p, i)] = "pie"
+    # Una sola página en la que todo caería en la cabecera o el pie: es su cuerpo.
+    if n == 1 and all((0, i) in zona for i in range(len(pags[0]))):
+        zona.clear()
     # Notas: lo que queda bajo el filete (sin el pie).
     lineas_nota = []
     for p, ls in enumerate(pags):
@@ -227,8 +236,12 @@ def analizar_pdf(ruta):
                 for p, ls in enumerate(pags[1:], 1) if any((p, i) not in zona for i in range(len(ls)))]
         if tops:
             techo = min(tops) - 2
-            for i, l in enumerate(pags[0]):
-                if (0, i) not in zona and l["y1"] < techo:
+            libres = [i for i in range(len(pags[0])) if (0, i) not in zona]
+            membrete = [i for i in libres if pags[0][i]["y1"] < techo]
+            # Si se llevara todas las líneas de la página no es un membrete, sino su cuerpo: una
+            # página corta antes de otra que empieza más abajo.
+            if len(membrete) < len(libres):
+                for i in membrete:
                     zona[(0, i)] = "cab1"
     # Cada nota empieza en una línea con su número; las demás líneas la continúan.
     notas_pag = []
@@ -271,7 +284,10 @@ def analizar_pdf(ruta):
     paso_cuerpo = statistics.median([x for x in saltos if x > 0]) if saltos else None
     izq = min((l["x0"] for _, _, l in cuerpo), default=72)
     der = max((l["x1"] for _, _, l in cuerpo), default=w - 72)
-    return {"doc": doc, "pags": pags, "zona": zona, "notas": notas_pag, "llamadas": llamadas,
+    # Dónde acaba el contenido de cada página (cuerpo y notas), para ver si se cortó a propósito.
+    fin_pagina = [max((l["y1"] for i, l in enumerate(ls) if zona.get((p, i)) not in ("pie", "cab", "cab1")), default=None)
+                  for p, ls in enumerate(pags)]
+    return {"doc": doc, "pags": pags, "zona": zona, "notas": notas_pag, "llamadas": llamadas, "fin_pagina": fin_pagina,
             "cuerpo": cuerpo, "tam_cuerpo": tam_cuerpo, "paso_nota": paso_nota, "tam_nota": tam_nota,
             "extra_nota": extra_nota, "paso_cuerpo": paso_cuerpo, "w": w, "h": h, "n": n, "izq": izq, "der": der}
 
@@ -301,6 +317,11 @@ def continua_frase(prev, sig):
 
 VINETAS = "\u25cf\u25cb\u25a0\u25a1\u25c6\u25c7\u2022\u25aa\u25ab\u25e6\u2023\u2043\uf0b7\uf0a7"
 RE_NUMERO_LISTA = re.compile(r"^(\d{1,3}|[a-zA-Z]|[ivx]{1,5}|[IVX]{1,5})[.)]$")
+# Hueco tras un número de lista que no puede ser un espacio normal, ni estirado por el justificado.
+HUECO_NUMERO_LISTA = 8
+# Una página (no la última) cuyo contenido acaba antes de este tanto por uno de su altura termina
+# ahí a propósito. En los escritos del banco, la que menos llega lo hace al 85 %.
+PAGINA_CORTA = 0.70
 
 
 def etiqueta_de(l):
@@ -341,8 +362,8 @@ def etiqueta_de(l):
     ult = k - 1
     if not RE_NUMERO_LISTA.match(texto):
         return None
-    cf, _, x = tras(ult)
-    if x is not None and cf:
+    cf, hueco, x = tras(ult)
+    if x is not None and (cf or hueco >= HUECO_NUMERO_LISTA):
         return texto, x
     return None
 
@@ -419,6 +440,10 @@ def parrafos_pdf(a):
             item = {"x_cont": None} if et else None
             continue
         pp_, _, prev = cuerpo[k - 1]
+        if pp_ != p and pagina_corta(a, pp_):
+            empieza.append(True)
+            item = {"x_cont": None} if et else None
+            continue
         llena = prev["x1"] >= a["der"] - 30 and prev["x1"] - prev["x0"] > (a["der"] - a["izq"]) * 0.6
         if pp_ == p:
             salto = l["base"] - prev["base"]
@@ -1705,8 +1730,22 @@ def posprocesar(pdf, docx_in, docx_out, notas=True, listas=True):
                 plan_notas = runs
 
     # 3. Cabecera y pie desde las líneas del PDF.
+    def en_el_cuerpo(p, l):
+        """La línea sigue en el cuerpo (en un párrafo al que pdf2docx la unió, o en una tabla, como la
+        última línea de una firma visible con recuadro) y no tiene párrafo propio de cabecera o pie."""
+        t = nz(l["texto"])
+        textos = [(clase.get(el), nz(texto_p(el))) for el in segs[p] if el.tag == W + "p"]
+        textos += [("cuerpo", nz("".join(x.text or "" for x in el.iter(W + "t")))) for el in segs[p] if el.tag == W + "tbl"]
+
+        def dentro(trozo, tipo):
+            return any(c == tipo and trozo in x for c, x in textos)
+
+        # Dos firmas una al lado de la otra: una sola línea del PDF, cada trozo en su tabla.
+        trozos = [x for x in (nz(s["text"]) for s in l["spans"]) if x]
+        return bool(t) and not dentro(t, "cabpie") and (dentro(t, "cuerpo") or (len(trozos) > 1 and all(dentro(x, "cuerpo") for x in trozos)))
+
     def lineas_zona(p, zs):
-        return [l for i, l in enumerate(a["pags"][p]) if a["zona"].get((p, i)) in zs]
+        return [l for i, l in enumerate(a["pags"][p]) if a["zona"].get((p, i)) in zs and not en_el_cuerpo(p, l)]
 
     n = a["n"]
     ref = 1 if n >= 2 else 0
@@ -2035,8 +2074,9 @@ def posprocesar(pdf, docx_in, docx_out, notas=True, listas=True):
     # El primer párrafo del cuerpo, a su altura en la página 1 (el membrete ya no lo empuja).
     if a["cuerpo"]:
         primero = next((el for el in body.iter(W + "p") if clase.get(el) == "cuerpo"), None)
-        y0 = min(l["y0"] for pp, _, l in a["cuerpo"] if pp == 0)
-        if primero is not None:
+        # Sin cuerpo en la primera página (en blanco, o solo con lo que se repite), no hay altura que dar.
+        y0 = min((l["y0"] for pp, _, l in a["cuerpo"] if pp == 0), default=None)
+        if primero is not None and y0 is not None:
             sp = primero.find(f"{W}pPr/{W}spacing")
             if sp is not None:
                 # Menos lo que su propio interlineado exacto baja el texto (ver el margen superior).
@@ -2045,6 +2085,19 @@ def posprocesar(pdf, docx_in, docx_out, notas=True, listas=True):
                     alto = statistics.median(l["y1"] - l["y0"] for _, _, l in cuerpo_l)
                     baja = max(0.0, 0.65 * (int(sp.get(W + "line")) / TW - alto) - 0.7)
                 sp.set(W + "before", str(max(0, round((y0 - 1 - baja) * TW) - nuevos_m["top"])))
+
+    # Una página que acaba mucho antes del margen inferior (el autor cortó ahí): la siguiente empieza
+    # en página nueva, como en el PDF. Con el texto que fluye se perdía ese salto.
+    inf["saltos_de_pagina"] = 0
+    for el in primeros_de_pagina:
+        if el.getparent() is not body or clase.get(el) != "cuerpo":
+            continue
+        ppr = el.find(W + "pPr")
+        if pagina_corta(a, pag_de[el] - 1) and ppr is not None and ppr.find(W + "pageBreakBefore") is None:
+            # En el orden del esquema de pPr: tras pStyle, keepNext y keepLines.
+            antes = sum(1 for x in ppr if x.tag in (W + "pStyle", W + "keepNext", W + "keepLines"))
+            ppr.insert(antes, OxmlElement("w:pageBreakBefore"))
+            inf["saltos_de_pagina"] += 1
 
     # 7. Cabecera y pie reales.
     sec = doc.sections[-1]

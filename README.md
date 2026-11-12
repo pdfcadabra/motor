@@ -476,10 +476,10 @@ Desde la versión 1.4.0.
   | `PDF_MIXED_SCAN` | `hidden_text` | Una página con texto visible tiene además texto invisible sin un escaneo debajo: no se sabe qué es ni si saldría entero. |
   | `PDF_MIXED_SCAN` | `ocr_text` | PDF con páginas de texto y páginas escaneadas con OCR al que, convertido, le faltaría texto del OCR (con los recuentos `ocr_*`). |
   | `PDF_UNSUPPORTED` | `ocr_text` | Lo mismo, con todas las páginas escaneadas. |
-  | `PDF_UNSUPPORTED` | `form` | Tiene campos de formulario. |
+  | `PDF_UNSUPPORTED` | `form` | Tiene campos de formulario distintos de los de firma (desde la 1.4.1, un PDF cuyos únicos campos son de firma se convierte, sin la firma, y el texto visible de una firma visible queda en el `.docx`). |
   | `PDF_UNSUPPORTED` | `rotated` | Alguna página con `/Rotate` o con más del 10 % de su texto visible girado. |
   | `PDF_UNSUPPORTED` | `images` | pdf2docx necesitaría OpenCV (dibujos vectoriales, imágenes giradas). |
-  | `PDF_UNSUPPORTED` | `layout` | pdf2docx no da una sección por página (por ejemplo, con varias columnas): sin el posprocesado, el `.docx` no se puede editar bien. |
+  | `PDF_UNSUPPORTED` | `layout` | pdf2docx no da una sección por página (por ejemplo, con varias columnas): sin el posprocesado, el `.docx` no se puede editar bien. Desde la 1.4.1, también un fallo inesperado del posprocesado (con `error_type`, el tipo de la excepción); sin memoria o sin disco sigue siendo un error. |
 
 - Texto de un OCR: pdf2docx no lee el texto invisible, que es como deja un OCR su capa de
   texto sobre el escaneo. Una página escaneada con OCR es una con texto invisible y sin texto
