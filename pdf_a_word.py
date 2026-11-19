@@ -273,6 +273,24 @@ def only_signature_fields(doc):
     return True
 
 
+def signature_rects(doc):
+    """{índice de página: [(x0, y0, x1, y1), ...]}: recuadros (coordenadas de la página, como las
+    del texto) de los widgets de firma con apariencia. El posprocesado no cuenta como cuerpo lo que
+    cae dentro al decidir si una página sola es toda cabecera o pie."""
+    rects = {}
+    for page in doc:
+        for xref, kind, _ in page.annot_xrefs():
+            if kind != pymupdf.PDF_ANNOT_WIDGET or _field_type(doc, xref) != "/Sig":
+                continue
+            try:
+                r = page.load_widget(xref).rect
+            except Exception:  # noqa: BLE001 - sin recuadro, la firma no se descuenta
+                continue
+            if not r.is_empty:
+                rects.setdefault(page.number, []).append(tuple(r))
+    return rects
+
+
 def check(doc, max_pages):
     """Rechazos antes de convertir. Devuelve las páginas escaneadas con OCR (las que se convierten
     desde la copia del OCR): las que tienen texto invisible y ninguno visible, y las que tienen los
@@ -420,6 +438,7 @@ def convert(input_path, output_path, max_pages, lists=True):
     pages = doc.page_count
     ocr_pages = check(doc, max_pages)
     signature_fields = bool(doc.is_form_pdf)  # tras check, solo pueden ser campos de firma
+    signatures = signature_rects(doc) if signature_fields else {}
     doc.close()
 
     from cv2 import OpenCVNoDisponible
@@ -449,7 +468,7 @@ def convert(input_path, output_path, max_pages, lists=True):
         # posprocesado (40 págs.: pico de 186 MB en vez de 248).
         release_memory()
         try:
-            inf = posproceso.posprocesar(source, raw, output_path, listas=lists)
+            inf = posproceso.posprocesar(source, raw, output_path, listas=lists, firmas=signatures)
         except Exception as e:  # noqa: BLE001 - red de seguridad: lo inesperado no es un 500
             # Sin memoria o sin disco sigue siendo un fallo del servicio, no del PDF. Al informe va
             # solo el tipo de la excepción: nunca su texto, que puede llevar texto del documento.

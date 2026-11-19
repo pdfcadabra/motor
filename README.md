@@ -17,11 +17,12 @@ ninguna imagen). Está escrito en Python sobre
 |---|---|---|
 | `redact.py` | `search` | Busca expresiones regulares en el texto de las páginas (también en los campos de formulario y las anotaciones, que aplana antes) y devuelve cada aparición con su rectángulo. Opcionalmente, también datos españoles con validación propia (`detectores.py`: NIG, matrícula, teléfono, correo e IBAN). |
 | `redact.py` | `apply` | Censura de forma irreversible las zonas indicadas: elimina el texto, los píxeles de las imágenes y los trazos que tocan cada zona, y pinta encima un recuadro negro. Después limpia lo que pueda contener los términos censurados fuera de las páginas (metadatos Info y XMP, marcadores, adjuntos, nombres de capas, acciones, texto oculto…) y vuelve a buscarlos en el resultado. Si queda cualquier rastro, no escribe la salida. |
-| `lossless_images.py` | `protect` | Antes de comprimir, sustituye las imágenes que no deben perder calidad (1 bit, paletas de hasta 16 colores, imágenes de 8 bits sin JPEG con hasta 16 colores) por un marcador diminuto. |
+| `lossless_images.py` | `protect` | Antes de comprimir, sustituye las imágenes que no deben perder calidad (1 bit, paletas de hasta 16 colores, imágenes de 8 bits sin JPEG con hasta 16 colores) por un marcador diminuto. Desde la 1.5.0, con `--jbig2`, prepara además una copia con las de 1 bit en JBIG2 genérico sin pérdida (`jbig2.py`, verificadas píxel a píxel). |
 | `jpeg_flate.py` | (restore) | Después de comprimir, vuelve a poner las imágenes originales en lugar de sus marcadores y envuelve en Flate los JPEG cuando así ocupan menos (sin pérdida). |
 | `pdf_check.py` | `verify` | Comprueba que un resultado se abre, tiene las mismas páginas que la entrada y no ha dejado vacía ninguna página con contenido. |
 | `pdf_check.py` | `info` | Dice si el PDF lleva una firma electrónica y si declara PDF/A. |
 | `lossless_clean.py` | (limpieza) | Comprime sin pérdida: capa Flate en los JPEG, subconjunto de las fuentes TrueType completas, objetos sin usar y repetidos fuera, Flate y flujos de objetos. No recodifica ni reduce ninguna imagen ni toca el contenido de las páginas. Respeta PDF/A. |
+| `reduce_bn.py` | `reduce`, `estimate` | Desde la 1.5.0. CON PÉRDIDA y solo si se pide: baja los escaneos de página en blanco y negro a una resolución dada (nunca menos de 150 ppp), con los códigos de barras y QR de dentro superpuestos sin pérdida; y estima cuánto ocuparía el PDF así. |
 | `perfil.py` | (perfil) | Reparte el peso del PDF (imágenes protegidas, JPEG, otras imágenes, fuentes) y da el motivo por el que no se puede comprimir más. |
 | `pdf_a_word.py` | (PDF a Word) | Desde la 1.4.0. Convierte un escrito de texto a Word (.docx) con [pdf2docx](https://pypi.org/project/pdf2docx/0.5.13/) y un posprocesado propio (`posproceso.py`): una sola sección, cabecera y pie reales con el número de página como campo, párrafos que fluyen, sangrías, notas al pie y listas de Word reales. Rechaza con un motivo lo que no sabe convertir bien (escaneos sin texto, formularios, páginas giradas, dibujos, varias columnas). |
 
@@ -33,14 +34,22 @@ ejecuciones y solo lee y escribe las rutas que recibe como argumentos.
 - Python 3.13, el de Debian 13 «trixie», que es con el que se prueba (PyMuPDF 1.28.2 pide
   3.10 o posterior).
 - Las dependencias de [`requirements.txt`](requirements.txt), con versiones exactas:
-  PyMuPDF 1.28.2 y Pillow 12.3.0.
+  PyMuPDF 1.28.2, Pillow 12.3.0 y, desde la 1.5.0, zxing-cpp 3.1.1 (`reduce_bn.py`: busca los
+  códigos que se superponen sin pérdida y comprueba que se siguen leyendo; sin él, `reduce_bn.py`
+  no reduce nada).
 - Solo para `pdf_a_word.py`: las de [`requirements-word.txt`](requirements-word.txt), con
   versiones exactas y todas escritas (pdf2docx y lo que necesita), que se instalan con
   `pip install --no-deps -r requirements-word.txt`: pdf2docx pide además OpenCV y fire, que no
   se usan (OpenCV lo sustituye [`sin_opencv/cv2.py`](sin_opencv/cv2.py), un módulo vacío).
 - Solo para la cadena de compresión y parte de los tests: Ghostscript (`gs`).
-- Solo para los tests: [`requirements-test.txt`](requirements-test.txt) (añade zxing-cpp,
-  que genera y decodifica los QR y códigos de barras de prueba).
+- Desde la 1.5.0, para JBIG2 (`protect --jbig2` y `reduce_bn.py`): el programa `jbig2` de
+  [jbig2enc](https://github.com/agl/jbig2enc) (paquete `jbig2` de Debian). Sin él no se
+  convierte nada a JBIG2 (todo lo demás funciona igual). Se lanza con `setpriv --pdeathsig KILL`
+  (util-linux) si está, para que muera si se mata al proceso de Python.
+- Solo para los tests: [`requirements-test.txt`](requirements-test.txt) (desde la 1.5.0 no añade
+  nada a `requirements.txt`, que ya trae zxing-cpp para generar y decodificar los QR y códigos de
+  barras de prueba). Con `tesseract` (y el idioma `spa`) en el PATH, `reduce_bn_test.py` mide
+  además la legibilidad con OCR a 200 ppp; sin él, esa prueba se salta.
 
 ## Construir y ejecutar
 
@@ -59,7 +68,7 @@ Tests:
 
 ```bash
 pip install -r requirements-test.txt
-python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py
+python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py jbig2_test.py reduce_bn_test.py
 ```
 
 Las pruebas que comprimen de verdad necesitan Ghostscript. Las de la clase
@@ -99,6 +108,9 @@ Reglas comunes:
 - Las rutas pueden ser absolutas o relativas al directorio de trabajo.
 - Los JSON se leen y escriben en UTF-8.
 - stdout: solo `protect` escribe en él (ver abajo). Los demás no escriben nada.
+- Carpeta temporal: los comandos que usan jbig2enc (`protect --jbig2` y `reduce_bn.py`) escriben
+  sus PBM en la de `TMPDIR` (la del sistema si no está) y los borran al terminar (salvo si se
+  les mata).
 - stderr: mensajes para personas, en español. No forman parte de la interfaz: pueden
   cambiar en cualquier versión. No incluyen el contenido de los documentos.
 - Los PDF con contraseña de apertura no se procesan (código 3). Los que solo tienen
@@ -119,7 +131,7 @@ Reglas comunes:
 |---|---|
 | 0 | Correcto. En `apply`, el informe dice si la censura se ha verificado. |
 | 1 | Error inesperado (por ejemplo, un PDF que no se puede abrir). |
-| 2 | Argumentos incorrectos (`protect`, `jpeg_flate.py`, `verify`, `info`, `lossless_clean.py` y `perfil.py`). |
+| 2 | Argumentos incorrectos (`protect`, `jpeg_flate.py`, `verify`, `info`, `lossless_clean.py`, `perfil.py` y `reduce_bn.py`, también con `--ppp` fuera de 150-1200). |
 | 3 | El PDF de entrada tiene contraseña de apertura: no se ha procesado. |
 | 4 | Según el comando: `search`, patrones no válidos; `jpeg_flate.py`, no se han podido restaurar las imágenes protegidas; `verify`, la salida no es válida. |
 
@@ -349,15 +361,27 @@ espacio de `Page.search_for` de PyMuPDF.
 
 - Salida: 0 (se ha escrito el informe: mirar `verified`); 1; 3.
 
-### `lossless_images.py protect ENTRADA SALIDA`
+### `lossless_images.py protect ENTRADA SALIDA [--jbig2 ORIGINALES]`
 
 - `ENTRADA`: PDF.
 - `SALIDA` (escribe): copia de la entrada con cada imagen protegida sustituida por un
   marcador (una ImageMask de 64x2 píxeles que lleva el número de objeto de la original).
   Solo se escribe si hay alguna imagen protegida.
+- `ORIGINALES` (escribe; desde la 1.5.0): copia de la entrada, con los mismos números de
+  objeto, en la que las imágenes protegidas de 1 bit van en JBIG2 genérico sin pérdida (ver
+  abajo). Solo se escribe si ha convertido alguna. Es la que se pasa a `jpeg_flate.py
+  --originals` en lugar de `ENTRADA`.
 - stdout: una línea con el número de imágenes protegidas (`0` si ninguna; entonces no
-  escribe `SALIDA`).
+  escribe `SALIDA`); con `--jbig2`, en la misma línea y tras un espacio, cuántas ha pasado a
+  JBIG2 (`3 2`).
 - Salida: 0; 1; 2; 3.
+
+JBIG2 (desde la 1.5.0): región genérica de jbig2enc (`jbig2 -p`), nunca el modo de símbolos
+(`-s`), que sustituye letras parecidas por la misma. Cada imagen se decodifica después (MuPDF) y
+tiene que dar exactamente los mismos bits que la original (salvo los de relleno del final de
+cada fila); si no, o si no ocupa menos, se queda como estaba. El diccionario se escribe sin
+`/DecodeParms` (con `/DecodeParms null`, Ghostscript 10.05.1 la dibuja en blanco). Comprobado
+con MuPDF, Ghostscript, PDFium y Poppler: los mismos píxeles que la original.
 
 Las imágenes protegidas son las de 1 bit (DeviceGray, ICCBased, Indexed de 2 colores,
 ImageMask, JBIG2…), las Indexed de hasta 16 colores (o con una paleta mayor de la que solo
@@ -375,7 +399,8 @@ de la página como imágenes en línea. Con Ghostscript: `-dDownsampleMonoImages
 - `ORIGINAL`: el PDF que recibió `protect` (sin marcadores). Obligatorio si `protect`
   protegió alguna imagen; si no, se omite.
 - `SALIDA` (escribe): el PDF con las imágenes originales en su sitio (su flujo comprimido
-  tal cual; las de 1 bit en Flate pasan a CCITT G4 si así ocupan menos) y con los JPEG
+  tal cual, también el JBIG2 de `protect --jbig2`; las de 1 bit en Flate que no vengan en JBIG2
+  pasan a CCITT G4 si así ocupan menos) y con los JPEG
   envueltos en Flate cuando ocupan menos. No cambia nada más.
 - Salida: 0; 1; 2; 4 si queda algún marcador sin restaurar, un marcador apunta a algo que
   no es una imagen en `ORIGINAL` o una imagen está demasiado anidada (entonces no escribe
@@ -421,6 +446,43 @@ Desde la versión 1.3.0. Compresión sin pérdida, sin compresor externo:
   de quien la usa.
 - Salida: 0; 1; 2; 3 (entonces no escribe `SALIDA`).
 
+### `reduce_bn.py reduce ENTRADA SALIDA INFORME [--ppp N]` y `reduce_bn.py estimate ENTRADA INFORME [--ppp N]`
+
+Desde la versión 1.5.0. CON PÉRDIDA: solo para quien lo pida expresamente. `N`: resolución
+objetivo en ppp, entre 150 y 1200 (por defecto, 200).
+
+- Qué se reduce: las imágenes de 1 bit que son un escaneo de página (cada página que la dibuja
+  queda tapada al menos a la mitad) y cuya resolución en la página pasa de `N` × 1,1 en los dos
+  ejes; no las ImageMask ni las que tienen o son una máscara. Nada más cambia: ni las de color o
+  gris (sellos, firmas, fotos), ni las de 1 bit pequeñas (un código de barras insertado aparte).
+- Cómo: media por áreas a `N` ppp y umbral a la mitad, sin tramado; después JBIG2 genérico o
+  CCITT G4, lo que ocupe menos, verificado al decodificarlo (si no da los bits de la reducida, la
+  imagen se queda como estaba).
+- Códigos dentro del escaneo (QR, códigos de barras): los que zxing-cpp lee en la imagen original
+  se superponen sin pérdida (sus píxeles originales, con un margen) sobre la reducida. La imagen
+  pasa a ser un Form XObject del mismo número de objeto que dibuja la reducida y encima los
+  recortes en el mismo cuadrado unidad: el contenido de las páginas no cambia. Sin zxing-cpp no se
+  reduce ninguna imagen.
+- Códigos que se siguen leyendo: la reducida, ampliada a su tamaño original, con los recortes
+  encima, tiene que dar con zxing-cpp todos los códigos (formato y texto) que da el original; si
+  falta alguno, esa imagen no se reduce.
+- Lo demás, intacto: todas las imágenes de `ENTRADA` que no son escaneos reducidos (sellos y
+  firmas en color, fotos, códigos insertados aparte, máscaras) tienen que estar en `SALIDA` byte a
+  byte; si no, no se escribe `SALIDA`.
+- `reduce`: `INFORME` (escribe) `{"ppp", "images", "code_patches", "codes_unavailable",
+  "codes_lost", "not_identical", "untouched_changed"}` (reducidas, recortes de códigos, imágenes
+  sin reducir por falta de zxing-cpp, porque un código dejaría de leerse y por una codificación
+  que no se decodifica igual, y si se ha descartado la salida porque cambiaba otra imagen; los
+  dos campos nuevos, desde la 1.5.0 como todo el comando). `SALIDA` solo si `images` > 0.
+- `estimate`: `INFORME` (escribe) `{"ppp", "images", "bytes", "sampled", "estimate"}`: escaneos
+  que se reducirían, lo que ocupan, cuántos se han reducido de muestra (como mucho 6, repartidos
+  por el documento) y el tamaño estimado de `ENTRADA` con todos reducidos (por la proporción de
+  la muestra), o `null` si no hay ninguno (o falta zxing-cpp).
+- Legibilidad: con un escaneo sintético de texto de 8, 10 y 12 pt a 300 ppp, el OCR (Tesseract)
+  pierde alrededor del 1 % de las palabras a 200 ppp (y también a 240; más en cifras y en letra de
+  8 pt): por eso no es parte de la compresión normal y solo se hace si se pide.
+- Salida: 0; 1; 2; 3.
+
 ### `perfil.py ENTRADA INFORME`
 
 Desde la versión 1.3.0.
@@ -435,7 +497,7 @@ Desde la versión 1.3.0.
 
   | Motivo | Regla |
   |---|---|
-  | `bn_sin_perdida` | `prot` ≥ 0,8 |
+  | `bn_sin_perdida` | `prot` ≥ 0,8, o `prot` + `jpeg` + `sinperd` ≥ 0,5 y `prot` ≥ 0,8 × (`prot` + `jpeg` + `sinperd`) (desde la 1.5.1: un escaneo en blanco y negro con la capa de texto de un OCR) |
   | `vectorial` | `prot` + `jpeg` + `sinperd` < 0,05 |
   | `jpeg_ya_optimizado` | `jpeg` ≥ 0,8, `jpeg_q` ≤ 75 y `jpeg_ppp` ≤ 200 |
   | `escaneo_o_fotos_jpeg` | `jpeg` ≥ 0,8 |
@@ -560,17 +622,18 @@ fi
 # 1. Limpieza sin pérdida antes del compresor.
 python3 "$MOTOR/lossless_clean.py" "$ENTRADA" "$TRABAJO/limpio.pdf"
 
-# 2. protect: N imágenes sustituidas por marcadores (con 0 no escribe nada).
-N=$(python3 "$MOTOR/lossless_images.py" protect "$TRABAJO/limpio.pdf" "$TRABAJO/marcado.pdf")
+# 2. protect: N imágenes sustituidas por marcadores (con 0 no escribe nada) y J de 1 bit en
+# JBIG2 sin pérdida en jbig2.pdf (con 0 no lo escribe).
+read -r N J < <(python3 "$MOTOR/lossless_images.py" protect "$TRABAJO/limpio.pdf" "$TRABAJO/marcado.pdf" --jbig2 "$TRABAJO/jbig2.pdf")
 if [ "$N" -gt 0 ]; then
   GS_ENTRADA=$TRABAJO/marcado.pdf
-  ORIGINALES=(--originals "$TRABAJO/limpio.pdf")
+  if [ "$J" -gt 0 ]; then ORIGINALES=(--originals "$TRABAJO/jbig2.pdf"); else ORIGINALES=(--originals "$TRABAJO/limpio.pdf"); fi
 else
   GS_ENTRADA=$TRABAJO/limpio.pdf
   ORIGINALES=()
 fi
 
-# 3. Ghostscript. Las imágenes de 1 bit no se reducen y van en CCITT G4 sin pérdida, y
+# 3. Ghostscript. Las imágenes de 1 bit no se reducen ni pasan por él (marcadores), y
 # -dMaxInlineImageSize=0 impide que meta los marcadores en el contenido de la página.
 GS_ARGS=(-sDEVICE=pdfwrite -dCompatibilityLevel=1.4 "-dPDFSETTINGS=$AJUSTE"
          -dDownsampleColorImages=true "-dColorImageResolution=$PPP" -dColorImageDownsampleThreshold=1
@@ -620,7 +683,8 @@ todos, la entrada sin tocar.
 |---|---|---|---|
 | [PyMuPDF](https://pypi.org/project/PyMuPDF/1.28.2/) (incluye MuPDF) | 1.28.2 | AGPL-3.0 (o licencia comercial de Artifex) | Todo el motor. |
 | [Pillow](https://pypi.org/project/pillow/12.3.0/) | 12.3.0 | MIT-CMU | Recodificar las imágenes censuradas y leer la calidad de los JPEG (perfil). |
-| [zxing-cpp](https://pypi.org/project/zxing-cpp/3.1.1/) | 3.1.1 | Apache-2.0 | Solo tests. |
+| [zxing-cpp](https://pypi.org/project/zxing-cpp/3.1.1/) | 3.1.1 | Apache-2.0 | `reduce_bn.py` (buscar los códigos que se conservan sin pérdida y comprobar que se siguen leyendo) y tests. |
+| [jbig2enc](https://github.com/agl/jbig2enc) (programa `jbig2`, paquete de Debian 0.30) | la del sistema | Apache-2.0 (usa Leptonica, licencia de tipo BSD de 2 cláusulas) | JBIG2 genérico sin pérdida (programa aparte, por línea de comandos). Desde la 1.5.0. |
 | Ghostscript | la del sistema | AGPL-3.0-or-later | Compresor externo de la cadena de compresión (programa aparte, por línea de comandos). |
 | [pdf2docx](https://pypi.org/project/pdf2docx/0.5.13/) | 0.5.13 | MIT | `pdf_a_word.py`. Sin OpenCV ni fire, que pide pero no se usan (ver Requisitos). |
 | [python-docx](https://pypi.org/project/python-docx/1.2.0/) | 1.2.0 | MIT | `pdf_a_word.py` y `posproceso.py`. |

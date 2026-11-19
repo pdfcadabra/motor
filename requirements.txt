@@ -1,5 +1,8 @@
 # Dependencias de Python de la imagen (Dockerfile). Versiones exactas.
 # Pillow: recodificar las imágenes que censura redact.py (JPEG con las tablas DQT y el
 # submuestreo del original, JPEG CMYK y JPEG 2000; la rueda de Linux trae libjpeg y OpenJPEG).
+# zxing-cpp (desde la 1.5.0, Apache-2.0): reduce_bn.py busca los QR y códigos de barras de los
+# escaneos B/N (se conservan sin pérdida) y comprueba que se siguen leyendo; sin él, no reduce.
 PyMuPDF==1.28.2
 pillow==12.3.0
+zxing-cpp==3.1.1

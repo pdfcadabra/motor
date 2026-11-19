@@ -22,8 +22,15 @@ su número de objeto, Ghostscript la copia sin tocarla (sin pérdida, sin reduci
 de B/N no se reduce) y `restore` vuelve a poner en su lugar la imagen original, con su
 flujo comprimido tal cual. Las máscaras de las imágenes (/SMask, /Mask) no se sustituyen.
 
-Uso: python3 lossless_images.py protect <entrada.pdf> <salida.pdf>
-     (escribe en stdout cuántas protegió; con 0 no escribe la salida)
+Desde la 1.5.0, con `--jbig2 <originales.pdf>`: además escribe una copia de la entrada (con
+los mismos números de objeto) en la que las imágenes protegidas de 1 bit van en JBIG2 genérico
+sin pérdida (jbig2.py: verificadas píxel a píxel; si una no es idéntica u ocupa más, se queda
+como estaba). Esa copia es la que se pasa a jpeg_flate.py como --originals: así la conversión
+se hace una sola vez para todos los niveles. Solo la escribe si ha convertido alguna.
+
+Uso: python3 lossless_images.py protect <entrada.pdf> <salida.pdf> [--jbig2 <originales.pdf>]
+     (escribe en stdout cuántas protegió; con 0 no escribe la salida; con --jbig2, en la
+     misma línea y tras un espacio, cuántas pasó a JBIG2)
      La restauración la hace jpeg_flate.py con --originals.
 """
 import re
@@ -31,6 +38,7 @@ import sys
 
 import pymupdf
 
+import jbig2
 import pdf_check
 
 MAX_COLORS = 16
@@ -286,9 +294,27 @@ def restore(doc, original):
     return restored
 
 
+def jbig2_copy(path, xrefs, output):
+    """Copia de `path` con las imágenes `xrefs` de 1 bit en JBIG2 genérico sin pérdida, en
+    `output` (sin garbage: mismos números de objeto que `path`). Devuelve cuántas convirtió; con
+    0 no escribe nada."""
+    doc = pymupdf.open(path)
+    try:
+        converted = jbig2.convert_all(doc, [x for x in xrefs if jbig2.is_candidate(doc, x)])
+        if converted:
+            doc.save(output)
+        return converted
+    finally:
+        doc.close()
+
+
 def main(argv):
+    jbig2_out = None
+    if len(argv) == 6 and argv[4] == "--jbig2":
+        jbig2_out = argv[5]
+        argv = argv[:4]
     if len(argv) != 4 or argv[1] != "protect":
-        print("Uso: python3 lossless_images.py protect <entrada.pdf> <salida.pdf>", file=sys.stderr)
+        print("Uso: python3 lossless_images.py protect <entrada.pdf> <salida.pdf> [--jbig2 <originales.pdf>]", file=sys.stderr)
         return 2
     doc = pymupdf.open(argv[2])
     # Con contraseña de apertura no se procesa nada: server.js responde 422 PDF_ENCRYPTED. Antes
@@ -300,7 +326,12 @@ def main(argv):
     protected = protect(doc)
     if protected:
         doc.save(argv[3])
-    print(len(protected))
+    doc.close()
+    if jbig2_out is None:
+        print(len(protected))
+    else:
+        converted = jbig2_copy(argv[2], protected, jbig2_out) if protected else 0
+        print(len(protected), converted)
     return 0
 
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Blanca Molina Rojas (PDFcadabra)
 #
-# Motor PDFcadabra solo (ver README.md): Python, Ghostscript (cadena de compresión y tests)
+# Motor PDFcadabra solo (ver README.md): Python, Ghostscript (cadena de compresión y tests), jbig2enc
 # y las dependencias de requirements.txt en un entorno virtual.
 #
 #   docker build -t pdfcadabra-motor .
@@ -13,7 +13,7 @@ FROM debian:trixie-slim AS motor
 
 # Paquetes oficiales de Debian, sin modificar
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ghostscript python3 python3-venv \
+    && apt-get install -y --no-install-recommends ghostscript python3 python3-venv jbig2 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/opt/venv/bin:$PATH" \
@@ -35,7 +35,7 @@ ENTRYPOINT ["python3"]
 FROM motor AS tests
 COPY requirements-test.txt ./
 RUN pip install -r requirements-test.txt
-RUN python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py \
+RUN python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py jbig2_test.py reduce_bn_test.py \
     && touch /tmp/tests-ok
 
 # Imagen final: la de "motor", solo si los tests han pasado

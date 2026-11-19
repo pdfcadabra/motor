@@ -219,6 +219,44 @@ class CabeceraDeUnaPagina(Base):
                 self.assertNotIn(juzgado, cab)
 
 
+class SangriaDerecha(Base):
+    """Una sangría derecha solo se conserva si hay pruebas de ella: en un párrafo de varias líneas
+    que acaban todas claramente antes del margen (una cita). En los de una sola línea, alineados a la
+    izquierda o justificados, va a 0; en los centrados o a la derecha sitúa el texto y se deja."""
+
+    @staticmethod
+    def derecha(p):
+        ind = p.find(f"{W}pPr/{W}ind")
+        return int(ind.get(W + "right", "0")) if ind is not None else 0
+
+    def test_lineas_cortas_de_pdf_lib_sin_sangria_derecha(self):
+        # x08 (muestra de la web, pdf-lib): pdf2docx daba a las viñetas, los números y sus títulos
+        # 5346 twips (9,4 cm) de sangría derecha; al escribir en Word la línea se cortaba a mitad.
+        pdf = BANCO / "x08-listas-pdf-lib.pdf"
+        d1, d2, inf = self.convertir(pdf)
+        cortas = ("Lista con viñetas", "Primera viñeta", "Segunda viñeta", "Tercera viñeta", "Lista numerada",
+                  "Primer punto", "Segundo punto", "Tercer punto", "SEGUNDA PÁGINA", "Este texto va en la segunda")
+        # pdf2docx se la pone (si deja de hacerlo, este test ya no prueba nada).
+        antes = [p for p in parrafos_cuerpo(d1) if pp.texto_p(p).strip().startswith(cortas)]
+        self.assertTrue(antes and all(self.derecha(p) > 1000 for p in antes))
+        despues = {pp.texto_p(p).strip()[:20]: self.derecha(p) for p in parrafos_cuerpo(d2)
+                   if pp.texto_p(p).strip().startswith(cortas)}
+        self.assertEqual(len(despues), len(cortas))
+        self.assertEqual(set(despues.values()), {0}, despues)
+        self.assertGreaterEqual(inf["sangria_derecha_quitada"], len(cortas))
+        # Siguen siendo listas de Word.
+        self.assertEqual(len(items_numpr(d2)), 6)
+
+    def test_cita_sangrada_conserva_la_sangria_derecha(self):
+        # e03: las citas justificadas, sangradas a los dos lados, acaban todas unos 28 pt antes del
+        # margen: su sangría derecha (25,5 pt) es real.
+        _, d2, _ = self.convertir(ESCRITOS / "e03-apelacion-10p.pdf")
+        citas = [p for p in parrafos_cuerpo(d2) if pp.texto_p(p).lstrip().startswith("«La ")]
+        self.assertTrue(citas)
+        for p in citas:
+            self.assertEqual(self.derecha(p), 510)
+
+
 class SangriasFrancesas(Base):
     def test_sangria_tabulador_y_justificado(self):
         _, d2, inf = self.convertir(FORENSES / "f05-encabezamiento-francesas.pdf")

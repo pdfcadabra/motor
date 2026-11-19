@@ -576,6 +576,44 @@ class Perfil(unittest.TestCase):
         doc.save(src)
         self.assertEqual(self.hint(src), "bn_sin_perdida")
 
+    def bn_ocr_pdf(self, path, w, h, lines):
+        """Escaneo de 1 bit (aleatorio, sin comprimir) con una capa de texto invisible de un OCR
+        (`lines` líneas de palabras al azar, en el contenido de la página)."""
+        doc = pymupdf.open()
+        rng = random.Random(5)
+        x = doc.get_new_xref()
+        doc.update_object(x, f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /BitsPerComponent 1 /ColorSpace /DeviceGray >>")
+        doc.update_stream(x, bytes(rng.randrange(256) for _ in range(w * h // 8)))
+        page = doc.new_page()
+        page.insert_text((0, 0), " ")
+        doc.xref_set_key(page.xref, "Resources", f"<< /XObject << /Im {x} 0 R >> >>")
+        doc.update_stream(page.get_contents()[0], b"q 595 0 0 842 0 0 cm /Im Do Q")
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        for i in range(lines):
+            words = " ".join("".join(rng.choice(letters) for _ in range(rng.randint(2, 9))) for _ in range(12))
+            page.insert_text((40, 40 + (i % 55) * 14), words, fontsize=9, render_mode=3)
+        doc.save(path, deflate=True)
+        with pymupdf.open(path) as d:
+            return perfil.profile(d, os.path.getsize(path))
+
+    def test_escaneo_en_blanco_y_negro_con_ocr(self):
+        # La capa de texto del OCR no es imagen: las protegidas quedan por debajo del 80 % del
+        # archivo, pero son todas las imágenes y más de la mitad del archivo. Antes daba «otro».
+        d = tmp_dir(self)
+        src = os.path.join(d, "bn-ocr.pdf")
+        shares = self.bn_ocr_pdf(src, 800, 800, 220)
+        self.assertLess(shares["prot"], 0.8)
+        self.assertGreaterEqual(shares["prot"], 0.5)
+        self.assertEqual(perfil.hint(shares), "bn_sin_perdida")
+
+    def test_poca_imagen_protegida_no_es_escaneo(self):
+        # Un QR o un sello de 1 bit en un PDF que es sobre todo texto: no es un escaneo B/N.
+        d = tmp_dir(self)
+        shares = self.bn_ocr_pdf(os.path.join(d, "qr.pdf"), 200, 200, 220)
+        self.assertLess(shares["prot"], 0.5)
+        self.assertGreaterEqual(shares["prot"], 0.05)
+        self.assertEqual(perfil.hint(shares), "otro")
+
     def test_jpeg(self):
         d = tmp_dir(self)
         # 900 px en 216 pt = 300 ppp, calidad 90: escaneo; 300 px en 216 pt = 100 ppp, calidad 50: ya optimizado.

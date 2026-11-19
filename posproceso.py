@@ -175,7 +175,10 @@ def pagina_corta(a, p):
     return fin is not None and fin < PAGINA_CORTA * a["h"]
 
 
-def analizar_pdf(ruta):
+def analizar_pdf(ruta, firmas=None):
+    """`firmas`: {índice de página: [(x0, y0, x1, y1), ...]} con los recuadros de las apariencias de
+    los campos de firma del PDF original (la copia de trabajo los tiene ya aplanados en el
+    contenido). Solo cuentan en una página sola: ver «firma» más abajo."""
     doc = pymupdf.open(ruta)
     pags = lineas_pdf(doc)
     n = len(pags)
@@ -218,8 +221,16 @@ def analizar_pdf(ruta):
                 zona[(p, i)] = "cab1"
             elif n == 1 and l["y0"] > h * 0.90:
                 zona[(p, i)] = "pie"
-    # Una sola página en la que todo caería en la cabecera o el pie: es su cuerpo.
-    if n == 1 and all((0, i) in zona for i in range(len(pags[0]))):
+    # Una sola página en la que todo caería en la cabecera o el pie: es su cuerpo. La apariencia de
+    # una firma no cuenta como cuerpo para eso: con la estampa de una firma PAdES visible abajo, el
+    # título de una página de una sola línea arriba (a 1,8 cm del borde) acababa en la cabecera.
+    recuadros = (firmas or {}).get(0, [])
+
+    def firma(l):
+        cx, cy = (l["x0"] + l["x1"]) / 2, (l["y0"] + l["y1"]) / 2
+        return any(r[0] <= cx <= r[2] and r[1] <= cy <= r[3] for r in recuadros)
+
+    if n == 1 and all((0, i) in zona or firma(l) for i, l in enumerate(pags[0])):
         zona.clear()
     # Notas: lo que queda bajo el filete (sin el pie).
     lineas_nota = []
@@ -322,6 +333,10 @@ HUECO_NUMERO_LISTA = 8
 # Una página (no la última) cuyo contenido acaba antes de este tanto por uno de su altura termina
 # ahí a propósito. En los escritos del banco, la que menos llega lo hace al 85 %.
 PAGINA_CORTA = 0.70
+# Un párrafo de varias líneas conserva su sangría derecha solo si todas sus líneas acaban al menos
+# este tanto (pt) antes del margen derecho: el doble de la tolerancia con que una línea «llega al
+# margen» (3 pt). Las citas sangradas del banco acaban unos 28 pt antes.
+SANGRIA_DERECHA_CLARA = 6
 
 
 def etiqueta_de(l):
@@ -1390,10 +1405,17 @@ def espacios_del_pdf(a, body, clase, comienzo, bloques, starts, multiplo, inf):
 
 def sangria_derecha(a, comienzo, bloques, starts, inf):
     """pdf2docx pone a un párrafo sin justificar una sangría derecha hasta su línea más larga (79 pt
-    en una viñeta de un PDF de Google Docs) y, al editar, las líneas se parten antes. Si en cada corte de línea
-    del PDF la primera palabra de la línea siguiente no cabía antes del margen derecho, es el margen
-    el que corta: sangría derecha 0. Si en algún corte sí cabía, hay una sangría de verdad (una cita)
-    y se deja. Solo en bloques sin justificar o elementos de lista."""
+    en una viñeta de un PDF de Google Docs; 9,4 cm en las viñetas cortas de un PDF de pdf-lib) y, al
+    editar, las líneas se parten antes. En un párrafo alineado a la izquierda o justificado:
+    - De una sola línea: nada prueba una sangría derecha real (la línea acaba donde acaba su texto):
+      sangría derecha 0.
+    - De varias líneas: solo se conserva si todas acaban claramente antes del margen derecho
+      (`SANGRIA_DERECHA_CLARA`; una cita sangrada a los dos lados). Además, en un bloque sin
+      justificar o un elemento de lista, si en cada corte de línea del PDF la primera palabra de la
+      línea siguiente no cabía antes del margen derecho, es el margen el que corta: 0. Si en algún
+      corte sí cabía, hay una sangría de verdad (una cita) y se deja.
+    En un párrafo centrado o alineado a la derecha la sangría sitúa el texto («HECHOS», las líneas de
+    la firma): no se toca."""
     import bisect
     inf["sangria_derecha_quitada"] = 0
     for el, k in comienzo.items():
@@ -1401,7 +1423,14 @@ def sangria_derecha(a, comienzo, bloques, starts, inf):
             continue
         b0, ls = bloques[bisect.bisect_right(starts, k) - 1]
         ind = el.find(f"{W}pPr/{W}ind")
-        if b0 != k or len(ls) < 2 or ind is None or int(ind.get(W + "right", "0")) <= 0:
+        if b0 != k or ind is None or int(ind.get(W + "right", "0")) <= 0:
+            continue
+        jc = el.find(f"{W}pPr/{W}jc")
+        if jc is not None and jc.get(W + "val") not in ("left", "start", "both"):
+            continue
+        if len(ls) < 2 or max(l["x1"] for l in ls) > a["der"] - SANGRIA_DERECHA_CLARA:
+            ind.set(W + "right", "0")
+            inf["sangria_derecha_quitada"] += 1
             continue
         # Solo en un bloque sin justificar (los finales de las líneas que no son la última varían más
         # de 3 pt) o en un elemento de lista: una cita justificada con sangría a los dos lados acaba
@@ -1637,8 +1666,8 @@ def bloques_juntos(a, comienzo, bloques, pagina_de_linea):
 
 # --- Posprocesado ---------------------------------------------------------------------------
 
-def posprocesar(pdf, docx_in, docx_out, notas=True, listas=True):
-    a = analizar_pdf(pdf)
+def posprocesar(pdf, docx_in, docx_out, notas=True, listas=True, firmas=None):
+    a = analizar_pdf(pdf, firmas)
     doc = Document(str(docx_in))
     body = doc.element.body
     segs = segmentos(body)

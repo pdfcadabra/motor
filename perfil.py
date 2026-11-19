@@ -11,7 +11,9 @@ Reparto de los bytes de los flujos tal como están en el archivo (fracción del 
 - fuentes: programas de fuente.
 
 Motivos (en este orden):
-- bn_sin_perdida: imágenes protegidas ≥ 80 % (escaneo en blanco y negro);
+- bn_sin_perdida: imágenes protegidas ≥ 80 % (escaneo en blanco y negro), o imágenes ≥ 50 % y las
+  protegidas ≥ 80 % de las imágenes (escaneo en blanco y negro con la capa de texto de un OCR,
+  que no es imagen: con solo la primera regla daba «otro»);
 - vectorial: imágenes < 5 % (texto y gráficos);
 - jpeg_ya_optimizado: JPEG ≥ 80 %, calidad ≤ 75 y ≤ 200 ppp;
 - escaneo_o_fotos_jpeg: JPEG ≥ 80 % (el resto);
@@ -111,7 +113,7 @@ def profile(doc, size):
 
 def hint(shares):
     images = shares["prot"] + shares["jpeg"] + shares["sinperd"]
-    if shares["prot"] >= 0.8:
+    if shares["prot"] >= 0.8 or (images >= 0.5 and shares["prot"] >= 0.8 * images):
         return "bn_sin_perdida"
     if images < 0.05:
         return "vectorial"

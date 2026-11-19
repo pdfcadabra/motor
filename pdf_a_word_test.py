@@ -661,6 +661,52 @@ class PaginasConPocoTexto(Base):
         self.assertIn("Una sola linea arriba del todo.", texto_docx(self.ruta("salida.docx")))
 
 
+class UnaPaginaConFirma(Base):
+    """En un PDF de una sola página, si todo lo que no es la apariencia de una firma caería en la
+    cabecera o el pie, todo es cuerpo (motor 1.5.0). Antes, la estampa de una firma visible contaba
+    como cuerpo y el título de una línea arriba pasaba a la cabecera de la primera página."""
+
+    def sin_cabecera_ni_pie(self, pdf, textos):
+        codigo, rep, salida, quedan = self.convertir(pdf)
+        self.assertEqual((codigo, salida), (0, ""))
+        self.assertEqual(quedan, ["informe.json", "salida.docx"])
+        self.assertEqual((rep["pages"], rep["header"], rep["first_page_header"], rep["footer"]), (1, False, False, False))
+        with zipfile.ZipFile(self.ruta("salida.docx")) as z:
+            for n in z.namelist():
+                if n.startswith(("word/header", "word/footer")):
+                    self.assertNotIn(b"<w:t", z.read(n), n)
+        xml = texto_docx(self.ruta("salida.docx"))
+        for t in textos:
+            self.assertIn(t, xml)
+
+    def test_titulo_arriba_y_firma_visible(self):
+        doc = pymupdf.open()
+        doc.new_page(width=595, height=842).insert_text((72, 52), f"RESOLUCION DE PRUEBA - {MARCA}", fontsize=12)
+        pdf = self.ruta("una.pdf")
+        doc.save(pdf)
+        firmar(pdf, visible=True)
+        self.sin_cabecera_ni_pie(pdf, ("RESOLUCION DE PRUEBA", FIRMA_VISIBLE))
+
+    @unittest.skipUnless(os.path.isdir(BANCO), "sin pruebas-pdf/pdf-a-word (motor solo)")
+    def test_fixture_firmado_de_una_linea(self):
+        # x09: la muestra de la web (una línea arriba, pdf-lib) con una firma PAdES visible abajo. El
+        # título acababa en header2.xml (cabecera de la primera página).
+        self.sin_cabecera_ni_pie(os.path.join(BANCO, "x09-pades-una-linea.pdf"),
+                                 ("Resolucion manzana1 - juicio ordinario 123/2026", "Firmado digitalmente por"))
+
+    def test_recuadros_de_las_firmas(self):
+        pdf = self.ruta("firmas.pdf")
+        escrito(pdf, paginas=1)
+        firmar(pdf, visible=True)
+        with pymupdf.open(pdf) as doc:
+            self.assertEqual(pdf_a_word.signature_rects(doc), {0: [(300.0, 732.0, 540.0, 782.0)]})
+        invisible = self.ruta("invisible.pdf")
+        escrito(invisible, paginas=1)
+        firmar(invisible)
+        with pymupdf.open(invisible) as doc:
+            self.assertEqual(pdf_a_word.signature_rects(doc), {})
+
+
 class FalloDelPosprocesado(Base):
     """Red de seguridad: lo inesperado en el posprocesado es un 422 sin datos, no un 500; la
     falta de memoria o de disco sigue siendo un fallo del servicio."""

@@ -207,17 +207,20 @@ def compress(inp, level, d):
     otras, lossless_clean.py -> protect -> gs (argumentos de server.js) -> jpeg_flate ->
     lossless_clean.py (server.js entrega además el menor de esos candidatos y de los de los
     niveles inferiores; aquí se prueba la cadena entera)."""
-    low, marked, gs_out, post, out = (os.path.join(d, f"{level}-{n}.pdf") for n in ("low", "marked", "gs", "post", "out"))
+    low, marked, jb, gs_out, post, out = (os.path.join(d, f"{level}-{n}.pdf") for n in ("low", "marked", "jbig2", "gs", "post", "out"))
     lossless_clean.clean(inp, low)
     if level == "low":
         return low
     doc = pymupdf.open(low)
-    n = len(li.protect(doc))
+    protected = li.protect(doc)
+    n = len(protected)
     if n:
         doc.save(marked)
     doc.close()
+    # Como protect --jbig2 (motor 1.5.0): copia con las de 1 bit en JBIG2 sin pérdida, si alguna.
+    converted = li.jbig2_copy(low, protected, jb) if n else 0
     subprocess.run([GS, *compress_args(level, marked if n else low, gs_out)], check=True, capture_output=True)
-    jpeg_flate.main(gs_out, post, low if n else None)
+    jpeg_flate.main(gs_out, post, (jb if converted else low) if n else None)
     lossless_clean.clean(post, out)
     return out
 
