@@ -15,6 +15,10 @@ jbig2enc es un programa aparte (se lanza un proceso por imagen, con un PBM en un
 temporal que se borra al terminar). Con `setpriv --pdeathsig KILL` (util-linux), si a este
 proceso de Python se le mata (tope de tiempo, cliente que se va), jbig2 muere con él y no
 queda huérfano. Sin el programa `jbig2` en el PATH, no se convierte nada (`available()`).
+
+Desde la 1.5.2, convert_all con la ruta del PDF reparte jbig2enc entre procesos de trabajo
+(paralelo.py); la verificación de cada imagen y su sustitución siguen en el proceso principal, en el
+mismo orden, así que la salida es la misma que con uno solo.
 """
 import os
 import shutil
@@ -23,9 +27,17 @@ import tempfile
 
 import pymupdf
 
+import paralelo
+
 # Tope por imagen (una página A4 a 300 ppp tarda unos 60 ms).
 TIMEOUT = 60
 _SETPRIV = shutil.which("setpriv")
+# convert_all con la ruta del PDF (desde la 1.5.2): jbig2enc en procesos de trabajo (paralelo.py),
+# cada uno con su copia del PDF; la verificación y la sustitución, en el principal y en el orden de
+# siempre (convert). Memoria de cada proceso (una página A4 a 300 ppp: 1,1 MB de bits; se cuenta de
+# más) y mínimo de imágenes para usar procesos.
+WORKER_BYTES = 192 * 2 ** 20
+PARALLEL_MIN = 8
 
 
 def available():
@@ -121,9 +133,10 @@ def is_candidate(doc, xref):
         return False
 
 
-def convert(doc, xref, tmpdir=None):
+def convert(doc, xref, tmpdir=None, encoded=False):
     """Pasa la imagen `xref` de `doc` (en memoria) a JBIG2 genérico si ocupa menos y se
-    decodifica con los mismos píxeles. Devuelve True si la ha sustituido."""
+    decodifica con los mismos píxeles. Devuelve True si la ha sustituido. `encoded`: el JBIG2 ya
+    calculado en un proceso de trabajo con los mismos bits (None: no se pudo); sin él, aquí."""
     if not is_candidate(doc, xref):
         return False
     try:
@@ -135,7 +148,8 @@ def convert(doc, xref, tmpdir=None):
         return False
     if not raw or width <= 0 or height <= 0:
         return False
-    encoded = encode(raw, width, height, tmpdir)
+    if encoded is False:
+        encoded = encode(raw, width, height, tmpdir)
     if encoded is None or len(encoded) >= len(old):
         return False
     before = doc.xref_object(xref, compressed=True)
@@ -151,15 +165,51 @@ def convert(doc, xref, tmpdir=None):
     return True
 
 
-def convert_all(doc, xrefs, tmpdir=None):
-    """convert() de cada xref. Devuelve cuántas ha pasado a JBIG2."""
+_W = {}  # en cada proceso de trabajo: su copia del documento y la carpeta temporal
+
+
+def _worker_open(path, tmpdir):
+    _W["doc"] = pymupdf.open(path)
+    _W["tmp"] = tmpdir
+
+
+def _worker_close():
+    doc = _W.pop("doc", None)
+    if doc is not None:
+        doc.close()
+
+
+def _encode_xref(xref):
+    """En un proceso de trabajo: el JBIG2 de la imagen `xref` (lo que calcularía convert), o None."""
+    doc = _W["doc"]
+    if not is_candidate(doc, xref):
+        return None
+    try:
+        width = int(doc.xref_get_key(xref, "Width")[1])
+        height = int(doc.xref_get_key(xref, "Height")[1])
+        raw = doc.xref_stream(xref)
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw or width <= 0 or height <= 0:
+        return None
+    return encode(raw, width, height, _W["tmp"])
+
+
+def convert_all(doc, xrefs, tmpdir=None, path=None):
+    """convert() de cada xref. Devuelve cuántas ha pasado a JBIG2. `path`: el archivo del que se
+    abrió `doc`, aún sin cambios; con él, jbig2enc corre en procesos de trabajo (paralelo.py)."""
     if not available():
         return 0
     own = tmpdir is None
     if own:
         tmpdir = tempfile.mkdtemp(prefix="jbig2-")
     try:
-        return sum(1 for x in xrefs if convert(doc, x, tmpdir))
+        xrefs = list(xrefs)
+        n = paralelo.workers(len(xrefs), WORKER_BYTES, PARALLEL_MIN) if path else 1
+        if n == 1:
+            return sum(1 for x in xrefs if convert(doc, x, tmpdir))
+        with paralelo.Pool(n, _worker_open, (path, tmpdir), _worker_close) as pool:
+            return sum(1 for x, enc in zip(xrefs, pool.imap(_encode_xref, xrefs)) if convert(doc, x, tmpdir, enc))
     finally:
         if own:
             shutil.rmtree(tmpdir, ignore_errors=True)

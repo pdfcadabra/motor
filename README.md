@@ -27,7 +27,9 @@ ninguna imagen). Está escrito en Python sobre
 | `pdf_a_word.py` | (PDF a Word) | Desde la 1.4.0. Convierte un escrito de texto a Word (.docx) con [pdf2docx](https://pypi.org/project/pdf2docx/0.5.13/) y un posprocesado propio (`posproceso.py`): una sola sección, cabecera y pie reales con el número de página como campo, párrafos que fluyen, sangrías, notas al pie y listas de Word reales. Rechaza con un motivo lo que no sabe convertir bien (escaneos sin texto, formularios, páginas giradas, dibujos, varias columnas). |
 
 Cada comando es un proceso independiente: no usa la red, no guarda estado entre
-ejecuciones y solo lee y escribe las rutas que recibe como argumentos.
+ejecuciones y solo lee y escribe las rutas que recibe como argumentos. Desde la 1.5.2, `protect
+--jbig2` y `reduce_bn.py` pueden repartir sus imágenes entre procesos de trabajo propios
+(`paralelo.py`, ver «Reglas comunes»), que mueren con el comando.
 
 ## Requisitos
 
@@ -68,7 +70,7 @@ Tests:
 
 ```bash
 pip install -r requirements-test.txt
-python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py jbig2_test.py reduce_bn_test.py
+python3 -m unittest redact_test.py redact_leaks_test.py detectores_test.py lossless_images_test.py lossless_clean_test.py pdf_check_test.py pdf_a_word_test.py posproceso_test.py jbig2_test.py reduce_bn_test.py paralelo_test.py
 ```
 
 Las pruebas que comprimen de verdad necesitan Ghostscript. Las de la clase
@@ -111,6 +113,18 @@ Reglas comunes:
 - Carpeta temporal: los comandos que usan jbig2enc (`protect --jbig2` y `reduce_bn.py`) escriben
   sus PBM en la de `TMPDIR` (la del sistema si no está) y los borran al terminar (salvo si se
   les mata).
+- Procesos de trabajo (desde la 1.5.2): `protect --jbig2`, `reduce_bn.py reduce` y `reduce_bn.py
+  estimate`, con 8 imágenes o más, reparten el trabajo de cada imagen (decodificarla, jbig2enc y,
+  en `reduce_bn.py`, buscar los códigos y reducirla) entre procesos de trabajo (`paralelo.py`);
+  cada uno abre su copia de `ENTRADA` solo para leerla. El proceso principal verifica cada
+  codificación al decodificarla y escribe la salida en el mismo orden que con un solo proceso: la
+  salida es la misma, objeto a objeto (el `/ID` del tráiler lleva, como siempre, una parte al
+  azar en cada guardado). Cuántos: los núcleos que puede usar el proceso (afinidad y cuota de CPU
+  del cgroup) menos uno, como mucho 4, y nunca más de los que caben en el 70 % de la memoria del
+  contenedor entre los trabajos a la vez (`MOTOR_MAX_JOBS`, como `redact.py apply`). La variable
+  `MOTOR_WORKERS` los fija (1: todo en el proceso principal). Mueren con el principal
+  (`PR_SET_PDEATHSIG`): si se le mata, no quedan huérfanos. En Linux usan unos semáforos en
+  `/dev/shm` para comunicarse (nada del documento: los datos van por tuberías).
 - stderr: mensajes para personas, en español. No forman parte de la interfaz: pueden
   cambiar en cualquier versión. No incluyen el contenido de los documentos.
 - Los PDF con contraseña de apertura no se procesan (código 3). Los que solo tienen
@@ -446,7 +460,7 @@ Desde la versión 1.3.0. Compresión sin pérdida, sin compresor externo:
   de quien la usa.
 - Salida: 0; 1; 2; 3 (entonces no escribe `SALIDA`).
 
-### `reduce_bn.py reduce ENTRADA SALIDA INFORME [--ppp N]` y `reduce_bn.py estimate ENTRADA INFORME [--ppp N]`
+### `reduce_bn.py reduce ENTRADA SALIDA INFORME [--ppp N] [--hasta T]` y `reduce_bn.py estimate ENTRADA INFORME [--ppp N]`
 
 Desde la versión 1.5.0. CON PÉRDIDA: solo para quien lo pida expresamente. `N`: resolución
 objetivo en ppp, entre 150 y 1200 (por defecto, 200).
@@ -474,14 +488,23 @@ objetivo en ppp, entre 150 y 1200 (por defecto, 200).
   sin reducir por falta de zxing-cpp, porque un código dejaría de leerse y por una codificación
   que no se decodifica igual, y si se ha descartado la salida porque cambiaba otra imagen; los
   dos campos nuevos, desde la 1.5.0 como todo el comando). `SALIDA` solo si `images` > 0.
-- `estimate`: `INFORME` (escribe) `{"ppp", "images", "bytes", "sampled", "estimate"}`: escaneos
-  que se reducirían, lo que ocupan, cuántos se han reducido de muestra (como mucho 6, repartidos
-  por el documento) y el tamaño estimado de `ENTRADA` con todos reducidos (por la proporción de
-  la muestra), o `null` si no hay ninguno (o falta zxing-cpp).
+- `--hasta T` (desde la 1.5.2; solo `reduce`): hora límite, en segundos desde 1970 (como
+  `time.time()`). Si se llega a ella o, tras procesar al menos 3 imágenes por proceso de trabajo,
+  al ritmo medido no acabaría antes, para sin escribir `SALIDA`, con `"timeout": true`,
+  `images` 0 y `code_patches` 0 en `INFORME` (el campo `timeout` solo sale entonces).
+- `estimate`: `INFORME` (escribe) `{"ppp", "images", "bytes", "sampled", "estimate", "seconds"}`:
+  escaneos que se reducirían, lo que ocupan, cuántos se han reducido de muestra (como mucho 6,
+  repartidos por el documento) y el tamaño estimado de `ENTRADA` con todos reducidos (por la
+  proporción de la muestra), o `null` si no hay ninguno (o falta zxing-cpp). `seconds` (desde la
+  1.5.2): segundos que tardaría `reduce` con `ENTRADA` en esta máquina, con los mismos procesos de
+  trabajo: la muestra pasa por todo lo de `reduce` salvo escribir, se mide lo que tarda cada
+  imagen y se calcula imágenes × media ÷ procesos, más 0,01 s por imagen y 2 s fijos (lo que no
+  depende de ellas: arrancar los procesos, elegir los escaneos, guardar y comprobar el resto);
+  `null` si no hay muestra que lo diga.
 - Legibilidad: con un escaneo sintético de texto de 8, 10 y 12 pt a 300 ppp, el OCR (Tesseract)
   pierde alrededor del 1 % de las palabras a 200 ppp (y también a 240; más en cifras y en letra de
   8 pt): por eso no es parte de la compresión normal y solo se hace si se pide.
-- Salida: 0; 1; 2; 3.
+- Salida: 0; 1; 2 (también con `--hasta` que no es un número finito, o con `estimate`); 3.
 
 ### `perfil.py ENTRADA INFORME`
 

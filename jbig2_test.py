@@ -273,3 +273,28 @@ class ProtegerConJbig2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_JBIG2, "falta el programa jbig2 (jbig2enc)")
+class ConvertirEnParalelo(unittest.TestCase):
+    """convert_all con la ruta del PDF (desde la 1.5.2): jbig2enc en procesos de trabajo y lo mismo
+    que con uno solo, objeto a objeto."""
+
+    def test_igual_que_en_serie(self):
+        d = tmp_dir(self)
+        src = os.path.join(d, "in.pdf")
+        doc = pymupdf.open()
+        xs = [add_image(doc, 1001, 700, CONVENTIONS[c], text_bits(seed=i))
+              for i, c in enumerate(["gris", "gris-decode-invertido", "indexed-2", "mascara", "gris"])]
+        doc.save(src)
+        outs = {}
+        for n in ("1", "3"):
+            with mock.patch.dict(os.environ, {"MOTOR_WORKERS": n}):
+                work = pymupdf.open(src)
+                self.assertEqual(jbig2.convert_all(work, xs, path=src), 5)
+                outs[n] = {x: (work.xref_object(x, compressed=True), work.xref_stream_raw(x)) for x in range(1, work.xref_length())}
+        self.assertEqual(outs["1"], outs["3"])
+        orig = pymupdf.open(src)
+        for x in xs:
+            self.assertEqual(outs["3"][x][0].count("/JBIG2Decode"), 1)
+        self.assertEqual(orig.xref_length(), len(outs["3"]) + 1)

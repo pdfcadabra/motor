@@ -300,7 +300,7 @@ def jbig2_copy(path, xrefs, output):
     0 no escribe nada."""
     doc = pymupdf.open(path)
     try:
-        converted = jbig2.convert_all(doc, [x for x in xrefs if jbig2.is_candidate(doc, x)])
+        converted = jbig2.convert_all(doc, [x for x in xrefs if jbig2.is_candidate(doc, x)], path=path)
         if converted:
             doc.save(output)
         return converted

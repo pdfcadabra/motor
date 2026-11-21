@@ -36,13 +36,22 @@ pierde alrededor del 1 % de las palabras a 200 ppp (más en cifras y en 8 pt): p
 si se pide, y quien lo pide lo hace sabiendo que pierde calidad.
 
 Uso:
-  python3 reduce_bn.py reduce ENTRADA SALIDA INFORME [--ppp N]
+  python3 reduce_bn.py reduce ENTRADA SALIDA INFORME [--ppp N] [--hasta T]
       INFORME: {"ppp", "images", "code_patches", "codes_unavailable", "codes_lost",
-      "not_identical", "untouched_changed"}; SALIDA solo si `images` > 0.
+      "not_identical", "untouched_changed"}; SALIDA solo si `images` > 0. Con --hasta (desde la
+      1.5.2; T, hora límite como time.time()): si no da tiempo a terminar antes de T, se para sin
+      escribir SALIDA, con `timeout`: true e `images` 0 (ver PROJECT_AFTER).
   python3 reduce_bn.py estimate ENTRADA INFORME [--ppp N]
-      INFORME: {"ppp", "images", "bytes", "sampled", "estimate"}: tamaño estimado de ENTRADA
-      con sus escaneos reducidos, por la proporción de una muestra (como mucho SAMPLE imágenes
-      repartidas por el documento); `estimate` null si no hay nada que reducir.
+      INFORME: {"ppp", "images", "bytes", "sampled", "estimate", "seconds"}: tamaño estimado de
+      ENTRADA con sus escaneos reducidos, por la proporción de una muestra (como mucho SAMPLE
+      imágenes repartidas por el documento); `estimate` null si no hay nada que reducir. `seconds`
+      (desde la 1.5.2): lo que tardaría reduce con ENTRADA en esta máquina, por el tiempo medido
+      de la muestra (null si no hay muestra que lo diga).
+
+En paralelo (desde la 1.5.2, paralelo.py): las imágenes se reparten entre procesos de trabajo, que
+las decodifican, buscan los códigos, las reducen y las codifican; el proceso principal verifica cada
+codificación al decodificarla y las escribe en el mismo orden que con un solo proceso, así que la
+salida es la misma.
 """
 import collections
 import hashlib
@@ -52,12 +61,13 @@ import os
 import shutil
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import time
 
 import pymupdf
 from PIL import Image
 
 import jbig2
+import paralelo
 import pdf_check
 
 MIN_PPP = 150
@@ -70,9 +80,21 @@ MIN_PAGE_SHARE = 0.5
 # Margen de blanco alrededor de cada código: lo mayor de esto y el 10 % de su lado mayor.
 CODE_MARGIN_PX = 16
 SAMPLE = 6
-# Hilos para lo que no es MuPDF (zxing-cpp, Pillow, jbig2): la API corre hasta 3 trabajos a la
-# vez en 4 CPU.
-THREADS = 2
+# Procesos de trabajo (paralelo.py, desde la 1.5.2): cada uno decodifica sus escaneos, busca los
+# códigos, reduce y codifica; el principal verifica cada codificación al decodificarla y escribe,
+# en el orden de siempre. Memoria de cada proceso (medida: unos 150 MB con una página A4 apaisada a
+# 300 ppp; se cuenta de más). Con menos de PARALLEL_MIN escaneos, todo en este proceso.
+WORKER_BYTES = 256 * 2 ** 20
+PARALLEL_MIN = 8
+# Con --hasta: tras PROJECT_AFTER × procesos imágenes, si al ritmo medido no acabaría antes de esa
+# hora, se para ahí (sin salida, `timeout` en el informe), sin esperar a que la API lo mate.
+PROJECT_AFTER = 3
+# Estimación del tiempo de reduce (`seconds` de estimate): las imágenes por los segundos medidos de
+# cada una de la muestra entre los procesos, más lo que no depende de ellas (arrancar los procesos,
+# elegir los escaneos, guardar y comprobar las demás imágenes), por imagen y fijo (medido con
+# escaneos sintéticos A4 apaisados a 300 ppp de 150, 398 y 600 páginas).
+ESTIMATE_FIXED_SECONDS = 2.0
+ESTIMATE_SECONDS_PER_IMAGE = 0.01
 
 
 class Encrypted(Exception):
@@ -186,8 +208,8 @@ def _jbig2(raw, width, height, tmpdir):
 
 def encodings(raw, width, height, tmpdir, jb=False):
     """[(datos, Filter, DecodeParms)] sin pérdida del bitmap, del menor al mayor. `jb`: el JBIG2
-    ya calculado (o None si no lo hay); sin él, se calcula aquí. Solo en el hilo principal (G4
-    con MuPDF)."""
+    ya calculado (o None si no lo hay); sin él, se calcula aquí. G4 con MuPDF: en un proceso de
+    trabajo o en el principal, no en un hilo."""
     out = [(_g4(raw, width, height), "/CCITTFaxDecode", f"<</K -1 /Columns {width} /Rows {height}>>")]
     data = _jbig2(raw, width, height, tmpdir) if jb is False else jb
     if data:
@@ -195,13 +217,14 @@ def encodings(raw, width, height, tmpdir, jb=False):
     return sorted(out, key=lambda e: len(e[0]))
 
 
-def _new_image(doc, src_xref, raw, width, height, tmpdir, jb=False):
+def _new_image(doc, src_xref, raw, width, height, tmpdir, jb=False, encs=None):
     """Objeto nuevo con el bitmap `raw` (verificado al decodificarlo) y el diccionario de
     `src_xref` (mismo espacio de color, /Decode, /Interpolate...) con el tamaño nuevo. None si
-    ninguna codificación se decodifica igual."""
+    ninguna codificación se decodifica igual. `encs`: las de encodings() ya calculadas (en un
+    proceso de trabajo)."""
     xref = doc.get_new_xref()
     src = doc.xref_object(src_xref, compressed=True)
-    for data, filt, parms in encodings(raw, width, height, tmpdir, jb):
+    for data, filt, parms in encodings(raw, width, height, tmpdir, jb) if encs is None else encs:
         doc.update_object(xref, src)
         jbig2.set_stream(doc, xref, data, filt, None if parms == "null" else parms, Width=width, Height=height)
         try:
@@ -298,13 +321,13 @@ def reduce_image(doc, xref, new_w, new_h, prep, tmpdir, report):
         return False
     small = prep["small"]
     old_len = len(doc.xref_stream_raw(xref))
-    reduced = _new_image(doc, xref, small, new_w, new_h, tmpdir, prep["small_jb"])
+    reduced = _new_image(doc, xref, small, new_w, new_h, tmpdir, prep["small_jb"], prep.get("small_encs"))
     if reduced is None:
         report["not_identical"] += 1
         return False
     patches = []
-    for box, crop, pw, ph, jb in prep["patches"]:
-        p = _new_image(doc, xref, crop, pw, ph, tmpdir, jb)
+    for box, crop, pw, ph, jb, *encs in prep["patches"]:
+        p = _new_image(doc, xref, crop, pw, ph, tmpdir, jb, encs[0] if encs else None)
         if p is None:
             for x in [reduced] + [q for q, _ in patches]:
                 doc.update_object(x, "null")
@@ -401,39 +424,81 @@ def _open(path):
     return doc
 
 
-def reduce(input_path, output_path, ppp):
+_W = {}  # en cada proceso de trabajo: su copia del documento y la carpeta temporal
+
+
+def _worker_open(path, tmpdir):
+    _W["doc"] = pymupdf.open(path)
+    _W["tmp"] = tmpdir
+
+
+def _worker_close():
+    doc = _W.pop("doc", None)
+    if doc is not None:
+        doc.close()
+
+
+def _work(task):
+    """En un proceso de trabajo (o en el principal, con uno solo): todo lo de una imagen salvo
+    escribirla. task = (xref, ancho_nuevo, alto_nuevo). Devuelve {"skip": True} si no se decodifica
+    (se queda como está) o el resultado de prepare() con las codificaciones de la reducida
+    (`small_encs`) y de cada recorte (un elemento más en cada uno de `patches`), sin verificar: eso
+    lo hace el principal al escribirlas (_new_image). Y `seconds`: lo que ha tardado."""
+    t = time.perf_counter()
+    xref, new_w, new_h = task
+    doc, tmpdir = _W["doc"], _W["tmp"]
+    width = int(_key(doc, xref, "Width")[1])
+    height = int(_key(doc, xref, "Height")[1])
+    try:
+        raw = doc.xref_stream(xref)
+    except Exception:  # noqa: BLE001 - una imagen que no se decodifica se queda
+        return {"skip": True}
+    if not raw or len(raw) != (width + 7) // 8 * height:
+        return {"skip": True}
+    prep = prepare(raw, width, height, new_w, new_h, tmpdir)
+    if prep is not None and not prep.get("codes_lost"):
+        prep["small_encs"] = encodings(prep["small"], new_w, new_h, tmpdir, prep["small_jb"])
+        prep["patches"] = [(box, crop, pw, ph, jb, encodings(crop, pw, ph, tmpdir, jb))
+                           for box, crop, pw, ph, jb in prep["patches"]]
+    return {"prep": prep, "seconds": time.perf_counter() - t}
+
+
+class _Timeout(Exception):
+    pass
+
+
+def reduce(input_path, output_path, ppp, until=None):
+    """Reduce los escaneos de `input_path` a `ppp` en `output_path`. `until` (hora, time.time()):
+    si no da tiempo a terminar antes, para sin escribir nada (`timeout` en el informe)."""
     doc = _open(input_path)
     report = {"ppp": ppp, "images": 0, "code_patches": 0, "codes_unavailable": 0, "codes_lost": 0,
               "not_identical": 0, "untouched_changed": False}
     tmpdir = tempfile.mkdtemp(prefix="bn-")
     try:
-        todo = iter(scans(doc, ppp).items())
-        pending = collections.deque()
+        tasks = [(xref, nw, nh) for xref, (nw, nh) in scans(doc, ppp).items()]
         reduced = set()
-        with ThreadPoolExecutor(THREADS) as pool:
-
-            def submit():
-                """Decodifica (MuPDF, aquí) la siguiente imagen y manda el resto a un hilo."""
-                for xref, (nw, nh) in todo:
-                    w = int(_key(doc, xref, "Width")[1])
-                    h = int(_key(doc, xref, "Height")[1])
-                    try:
-                        raw = doc.xref_stream(xref)
-                    except Exception:  # noqa: BLE001 - una imagen que no se decodifica se queda
+        n = paralelo.workers(len(tasks), WORKER_BYTES, PARALLEL_MIN)
+        first = None
+        try:
+            with paralelo.Pool(n, _worker_open, (input_path, tmpdir), _worker_close) as pool:
+                for i, ((xref, nw, nh), res) in enumerate(zip(tasks, pool.imap(_work, tasks)), 1):
+                    if not res.get("skip") and reduce_image(doc, xref, nw, nh, res["prep"], tmpdir, report):
+                        reduced.add(xref)
+                    if until is None:
                         continue
-                    if raw and len(raw) == (w + 7) // 8 * h:
-                        pending.append((xref, nw, nh, pool.submit(prepare, raw, w, h, nw, nh, tmpdir)))
-                        return
-
-            # Como mucho 2 × THREADS imágenes decodificadas a la vez (1,1 MB cada página A4 a 300 ppp).
-            for _ in range(2 * THREADS):
-                submit()
-            while pending:
-                xref, nw, nh, job = pending.popleft()
-                prep = job.result()
-                submit()
-                if reduce_image(doc, xref, nw, nh, prep, tmpdir, report):
-                    reduced.add(xref)
+                    now = time.time()
+                    first = first or now
+                    late = now >= until
+                    if not late and i >= PROJECT_AFTER * pool.n and i > 1:
+                        late = now + (now - first) / (i - 1) * (len(tasks) - i) > until
+                    if late:
+                        raise _Timeout()
+        except _Timeout:
+            report.update(images=0, code_patches=0, timeout=True)
+            return report
+        if until is not None and time.time() >= until:
+            report.update(images=0, code_patches=0, timeout=True)
+            return report
         if report["images"]:
             pdfa = pdf_check.pdfa(doc)
             doc.save(output_path, garbage=4, deflate=True,
@@ -453,11 +518,13 @@ def _small_jb(raw, width, height, new_w, new_h, tmpdir):
 
 
 def estimate(input_path, ppp):
+    """Tamaño estimado (`estimate`) y, desde la 1.5.2, segundos estimados de reduce (`seconds`):
+    la muestra pasa por lo mismo que en reduce (los mismos procesos de trabajo) y se mide."""
     doc = _open(input_path)
     tmpdir = tempfile.mkdtemp(prefix="bn-")
     try:
         found = scans(doc, ppp)
-        report = {"ppp": ppp, "images": len(found), "bytes": 0, "sampled": 0, "estimate": None}
+        report = {"ppp": ppp, "images": len(found), "bytes": 0, "sampled": 0, "estimate": None, "seconds": None}
         if not found:
             return report
         try:
@@ -469,47 +536,66 @@ def estimate(input_path, ppp):
         report["bytes"] = sum(len(doc.xref_stream_raw(x)) for x in xrefs)
         step = max(1, len(xrefs) // SAMPLE)
         sample = xrefs[::step][:SAMPLE]
+        tasks = [(x, *found[x]) for x in sample]
+        n = min(paralelo.workers(len(xrefs), WORKER_BYTES, PARALLEL_MIN), len(tasks))
         old = new = 0
-        jobs = []
-        with ThreadPoolExecutor(THREADS) as pool:
-            for x in sample:
+        seconds = []
+        with paralelo.Pool(n, _worker_open, (input_path, tmpdir), _worker_close) as pool:
+            workers = pool.n
+            for (x, nw, nh), res in zip(tasks, pool.imap(_work, tasks)):
+                old += len(doc.xref_stream_raw(x))
+                prep = None if res.get("skip") else res["prep"]
+                if prep is not None and "small_encs" in prep:
+                    new += len(prep["small_encs"][0][0])
+                    seconds.append(res["seconds"])
+                    continue
+                # No se reduciría (sin códigos legibles, no se decodifica): su tamaño, como antes.
                 w = int(_key(doc, x, "Width")[1])
                 h = int(_key(doc, x, "Height")[1])
-                nw, nh = found[x]
-                old += len(doc.xref_stream_raw(x))
-                jobs.append((nw, nh, pool.submit(_small_jb, doc.xref_stream(x), w, h, nw, nh, tmpdir)))
-            for nw, nh, job in jobs:
-                small, jb = job.result()
+                small, jb = _small_jb(doc.xref_stream(x), w, h, nw, nh, tmpdir)
                 new += len(encodings(small, nw, nh, tmpdir, jb)[0][0])
+                if not res.get("skip"):
+                    seconds.append(res["seconds"])
         report["sampled"] = len(sample)
         ratio = new / old if old else 1
         report["estimate"] = round(os.path.getsize(input_path) - report["bytes"] * (1 - min(ratio, 1)))
+        if seconds:
+            per_image = sum(seconds) / len(seconds)
+            report["seconds"] = round(ESTIMATE_FIXED_SECONDS + len(xrefs) * (
+                per_image / workers + ESTIMATE_SECONDS_PER_IMAGE), 1)
         return report
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         doc.close()
 
 
-USAGE = ("Uso: python3 reduce_bn.py reduce <entrada.pdf> <salida.pdf> <informe.json> [--ppp N]\n"
+USAGE = ("Uso: python3 reduce_bn.py reduce <entrada.pdf> <salida.pdf> <informe.json> [--ppp N] [--hasta T]\n"
          "     python3 reduce_bn.py estimate <entrada.pdf> <informe.json> [--ppp N]\n"
-         f"     (N entre {MIN_PPP} y {MAX_PPP}; por defecto {DEFAULT_PPP})")
+         f"     (N entre {MIN_PPP} y {MAX_PPP}; por defecto {DEFAULT_PPP}; T: hora límite en segundos\n"
+         "     desde 1970, como time.time())")
 
 
 def main(argv):
     args = argv[1:]
     ppp = DEFAULT_PPP
-    if len(args) >= 2 and args[-2] == "--ppp":
+    until = None
+    while len(args) >= 2 and args[-2] in ("--ppp", "--hasta"):
         try:
-            ppp = _check_ppp(args[-1])
+            if args[-2] == "--ppp":
+                ppp = _check_ppp(args[-1])
+            else:
+                until = float(args[-1])
+                if not math.isfinite(until):
+                    raise ValueError(until)
         except ValueError:
             print(USAGE, file=sys.stderr)
             return 2
         args = args[:-2]
     try:
         if len(args) == 4 and args[0] == "reduce":
-            report = reduce(args[1], args[2], ppp)
+            report = reduce(args[1], args[2], ppp, until)
             out = args[3]
-        elif len(args) == 3 and args[0] == "estimate":
+        elif len(args) == 3 and args[0] == "estimate" and until is None:
             report = estimate(args[1], ppp)
             out = args[2]
         else:

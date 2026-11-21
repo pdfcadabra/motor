@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -319,6 +320,123 @@ class Reduccion(unittest.TestCase):
         with open(rep, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["images"], 2)
         self.assertEqual(r.stdout, b"")
+
+
+def build_many(path, n):
+    """La página 1 de build() (con códigos) y n - 1 escaneos más sin códigos."""
+    doc = pymupdf.open()
+    page_with(doc, [(g4_image(doc, scan_raw(True)), 0, 0, 400, 280)])
+    for i in range(1, n):
+        page_with(doc, [(g4_image(doc, scan_raw(False, seed=10 + i)), 0, 0, 400, 280)])
+    doc.save(path)
+
+
+def objects(path):
+    """Todos los objetos de un PDF (diccionario y flujo sin decodificar), sin el tráiler: su /ID
+    lleva una parte al azar en cada guardado."""
+    with pymupdf.open(path) as doc:
+        return [(doc.xref_object(x, compressed=True), doc.xref_stream_raw(x) if doc.xref_is_stream(x) else None)
+                for x in range(1, doc.xref_length()) if doc.xref_get_key(x, "Type")[1] != "/XRef"]
+
+
+@unittest.skipIf(zxingcpp is None, "falta zxing-cpp (requirements-test.txt)")
+class EnParalelo(unittest.TestCase):
+    """Desde la 1.5.2: las imágenes se reparten entre procesos de trabajo (paralelo.py) y la salida
+    es la misma, objeto a objeto, que con uno solo."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = tempfile.mkdtemp(prefix="reduce-bn-test-")
+        cls.src = os.path.join(cls.d, "in.pdf")
+        build_many(cls.src, 5)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.d, True)
+
+    def run_with(self, workers, until=None):
+        out = os.path.join(self.d, f"o{workers}.pdf")
+        with mock.patch.dict(os.environ, {"MOTOR_WORKERS": str(workers)}):
+            return reduce_bn.reduce(self.src, out, 200, until), out
+
+    def test_misma_salida_con_uno_y_con_tres(self):
+        (r1, o1), (r3, o3) = self.run_with(1), self.run_with(3)
+        self.assertEqual(r1, r3)
+        self.assertEqual((r3["images"], r3["code_patches"]), (5, 2))
+        self.assertEqual(objects(o1), objects(o3))
+        out = pymupdf.open(o3)
+        self.assertEqual(codes_on(out, 0), {QR_TEXT, BAR_TEXT})
+
+    def test_misma_estimacion_y_con_segundos(self):
+        with mock.patch.dict(os.environ, {"MOTOR_WORKERS": "1"}):
+            e1 = reduce_bn.estimate(self.src, 200)
+        with mock.patch.dict(os.environ, {"MOTOR_WORKERS": "3"}):
+            e3 = reduce_bn.estimate(self.src, 200)
+        self.assertEqual({k: v for k, v in e1.items() if k != "seconds"}, {k: v for k, v in e3.items() if k != "seconds"})
+        for e in (e1, e3):
+            self.assertIsInstance(e["seconds"], float)
+            self.assertGreater(e["seconds"], reduce_bn.ESTIMATE_FIXED_SECONDS)
+
+    def test_con_tiempo_de_sobra_igual_que_sin_hora(self):
+        (r, o), (r0, o0) = self.run_with(3, time.time() + 3600), self.run_with(1)
+        self.assertEqual(r, r0)
+        self.assertEqual(objects(o), objects(o0))
+
+
+@unittest.skipIf(zxingcpp is None, "falta zxing-cpp (requirements-test.txt)")
+class SinTiempo(unittest.TestCase):
+    """--hasta (desde la 1.5.2): si no da tiempo, reduce para sin salida y lo dice (`timeout`)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = tempfile.mkdtemp(prefix="reduce-bn-test-")
+        cls.src = os.path.join(cls.d, "in.pdf")
+        build_many(cls.src, 6)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.d, True)
+
+    def test_hora_pasada(self):
+        out = os.path.join(self.d, "o.pdf")
+        for workers in ("1", "3"):
+            with mock.patch.dict(os.environ, {"MOTOR_WORKERS": workers}):
+                report = reduce_bn.reduce(self.src, out, 200, time.time() - 1)
+            self.assertEqual((report["timeout"], report["images"], report["code_patches"]), (True, 0, 0))
+            self.assertFalse(os.path.exists(out))
+
+    def test_para_en_cuanto_ve_que_no_llega(self):
+        # Reloj simulado: 5 s por imagen. Con la hora a 25 s, tras la 3.ª (a los 15 s) se ve que
+        # acabaría a los 30 s y se para ahí, sin hacer las otras 3.
+        clock = iter(range(5, 1000, 5))
+        done = []
+        real = reduce_bn.reduce_image
+
+        def counted(*a, **k):
+            done.append(1)
+            return real(*a, **k)
+
+        out = os.path.join(self.d, "o.pdf")
+        with mock.patch.dict(os.environ, {"MOTOR_WORKERS": "1"}), \
+                mock.patch.object(reduce_bn.time, "time", lambda: next(clock)), \
+                mock.patch.object(reduce_bn, "reduce_image", counted):
+            report = reduce_bn.reduce(self.src, out, 200, 25)
+        self.assertEqual((report["timeout"], report["images"]), (True, 0))
+        self.assertEqual(len(done), 3)
+        self.assertFalse(os.path.exists(out))
+
+    def test_cli(self):
+        out, rep = os.path.join(self.d, "c.pdf"), os.path.join(self.d, "c.json")
+        cli = [sys.executable, os.path.join(HERE, "reduce_bn.py")]
+        r = subprocess.run(cli + ["reduce", self.src, out, rep, "--ppp", "200", "--hasta", str(time.time() - 1)], capture_output=True)
+        self.assertEqual(r.returncode, 0)
+        with open(rep, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"ppp": 200, "images": 0, "code_patches": 0, "codes_unavailable": 0, "codes_lost": 0,
+                                            "not_identical": 0, "untouched_changed": False, "timeout": True})
+        self.assertFalse(os.path.exists(out))
+        for bad in (["reduce", self.src, out, rep, "--hasta", "x"], ["reduce", self.src, out, rep, "--hasta", "nan"],
+                    ["estimate", self.src, rep, "--hasta", "1"]):
+            self.assertEqual(subprocess.run(cli + bad, capture_output=True).returncode, 2, bad)
 
 
 class ImagenSinFiltro(unittest.TestCase):
