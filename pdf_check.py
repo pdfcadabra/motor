@@ -14,6 +14,8 @@
 - signed(doc): el PDF lleva alguna firma electrónica (un diccionario de firma con /ByteRange,
   también como valor de un campo de formulario /FT /Sig). Cualquier reescritura la invalida.
 - pdfa(doc): la parte y el nivel de PDF/A que declaran los metadatos XMP (pdfaid), o None.
+- object_numbers(doc): los números de objeto que existen (sin los libres ni los huecos que deja
+  una actualización incremental; ver la función).
 - python3 pdf_check.py info <entrada.pdf> <informe.json>: escribe {"signed": bool, "pdfa":
   "1B" | ... | null}. Sale con EXIT_ENCRYPTED si la entrada necesita contraseña (server.js lo
   lanza lo primero en Comprimir: con la baja ya no hay otro paso antes que lo detecte).
@@ -31,6 +33,16 @@ EXIT_INVALID = 4  # server.js no entrega la salida
 def needs_password(doc):
     """True si el PDF solo se abre con una contraseña de apertura que no tenemos."""
     return bool(doc.needs_pass) and not doc.authenticate("")
+
+
+def object_numbers(doc):
+    """Los números de objeto de `doc` que existen, de 1 a xref_length() - 1. Una actualización
+    incremental puede declarar un /Size mayor sin definir todos los números de en medio (pyHanko
+    lo hace al firmar: x04-x09 de pruebas-pdf/pdf-a-word): la norma toma un objeto no definido
+    por null, pero MuPDF da FzErrorFormat («cannot find object in xref») al pedirlo. Tampoco
+    devuelve los libres, que se leen como null."""
+    pdf = pymupdf._as_pdf_document(doc)
+    return [x for x in range(1, doc.xref_length()) if pymupdf.mupdf.pdf_object_exists(pdf, x)]
 
 
 def signed(doc):

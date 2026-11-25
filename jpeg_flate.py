@@ -20,6 +20,7 @@ import zlib
 import pymupdf
 
 import lossless_images
+import pdf_check
 
 # Las imágenes protegidas no se han podido restaurar (cualquier lossless_images.RestoreError:
 # un marcador sin restaurar, uno cuya imagen original no existe o una imagen demasiado anidada
@@ -30,7 +31,7 @@ EXIT_RESTORE_FAILED = 4
 def wrap_jpegs(doc):
     """Envuelve en Flate (zlib 9) cada JPEG de `doc` que así ocupe menos. Sin pérdida: los
     bytes del JPEG no cambian. También lo usa lossless_clean.py (nivel baja)."""
-    for xref in range(1, doc.xref_length()):
+    for xref in pdf_check.object_numbers(doc):
         if doc.xref_get_key(xref, "Subtype") != ("name", "/Image"):
             continue
         filter_type, filter_value = doc.xref_get_key(xref, "Filter")

@@ -458,6 +458,9 @@ Desde la versión 1.3.0. Compresión sin pérdida, sin compresor externo:
   objetos (ISO 19005-1 no los admite). El XMP queda sin comprimir.
 - `SALIDA` (escribe) puede ocupar lo mismo o más que `ENTRADA`: decidir si compensa es cosa
   de quien la usa.
+- Desde la 1.5.3, también una `ENTRADA` con números de objeto sin definir (los que deja una
+  actualización incremental, p. ej. al firmar con PAdES): antes salía con 1. Lo mismo en
+  `jpeg_flate.py`.
 - Salida: 0; 1; 2; 3 (entonces no escribe `SALIDA`).
 
 ### `reduce_bn.py reduce ENTRADA SALIDA INFORME [--ppp N] [--hasta T]` y `reduce_bn.py estimate ENTRADA INFORME [--ppp N]`

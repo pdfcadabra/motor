@@ -6,6 +6,7 @@ python -m unittest pdf_check_test.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,45 @@ def make_pdf(path, pages=2, user_pw=None, owner_pw=None, blank=()):
         }
     doc.save(path, **kwargs)
     return path
+
+
+def with_gap(src, dst):
+    """Copia de `src` (con tabla xref clásica) con una actualización incremental como la que
+    añade pyHanko al firmar: declara un /Size dos por encima y define solo el último número, así
+    que el de en medio no existe en ninguna tabla. Devuelve (dst, número que falta)."""
+    with open(src, "rb") as f:
+        data = f.read()
+    with pymupdf.open(src) as doc:
+        n = doc.xref_length()
+        root = doc.xref_get_key(-1, "Root")[1]
+    prev = int(re.findall(rb"startxref\s+(\d+)", data)[-1])
+    data += b"\n"
+    obj_at = len(data)
+    data += f"{n + 1} 0 obj\n<< /Producer (prueba) >>\nendobj\n".encode()
+    xref_at = len(data)
+    data += (f"xref\n0 1\n0000000000 65535 f \n{n + 1} 1\n{obj_at:010d} 00000 n \n"
+             f"trailer\n<< /Size {n + 2} /Root {root} /Info {n + 1} 0 R /Prev {prev} >>\n"
+             f"startxref\n{xref_at}\n%%EOF\n").encode()
+    with open(dst, "wb") as f:
+        f.write(data)
+    return dst, n
+
+
+class NumerosDeObjeto(unittest.TestCase):
+    def test_sin_el_hueco_de_una_actualizacion_incremental(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = make_pdf(os.path.join(d, "a.pdf"))
+            gapped, missing = with_gap(src, os.path.join(d, "hueco.pdf"))
+            with pymupdf.open(src) as doc:
+                all_numbers = list(range(1, doc.xref_length()))
+                self.assertEqual(pdf_check.object_numbers(doc), all_numbers)
+            with pymupdf.open(gapped) as doc:
+                self.assertEqual(doc.xref_length(), missing + 2)
+                # El hueco es real: MuPDF no lo da por null, falla al pedirlo.
+                with self.assertRaises(Exception):
+                    doc.xref_get_key(missing, "Subtype")
+                self.assertEqual(pdf_check.object_numbers(doc), all_numbers + [missing + 1])
+                self.assertEqual(doc.page_count, 2)
 
 
 class PdfCheckTest(unittest.TestCase):

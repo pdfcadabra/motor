@@ -88,7 +88,7 @@ def subset_truetype(doc):
     """Recorta las TrueType completas de `doc` (en memoria). Devuelve cuántas ha recortado."""
     form = _form_descriptors(doc)
     programs = {}
-    for xref in range(1, doc.xref_length()):
+    for xref in pdf_check.object_numbers(doc):
         if doc.xref_get_key(xref, "Type")[1] == "/FontDescriptor" and _program(doc, xref):
             programs[xref] = _program(doc, xref)
     # No se recortan: otro tipo de programa, las del formulario y cualquiera que comparta su

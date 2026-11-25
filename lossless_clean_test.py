@@ -30,6 +30,7 @@ import lossless_images as li
 import perfil
 import pdf_check
 from lossless_images_test import GS, QR_TEXT, BAR_TEXT, decode_page, make_codes_pdf, tmp_dir, zxingcpp
+from pdf_check_test import with_gap
 
 try:
     from PIL import Image
@@ -500,6 +501,68 @@ class PdfA(unittest.TestCase):
         self.assertEqual(lossless_clean.page_texts(src), lossless_clean.page_texts(out))
         self.assertEqual(renders(a), renders(b))
         self.assertIsNone(pdf_check.verify(src, out))
+
+
+class ActualizacionIncremental(unittest.TestCase):
+    """Un número de objeto sin definir (el hueco que deja pyHanko al firmar): MuPDF falla al
+    pedirlo, y antes la limpieza entera fallaba (en la API, la baja daba 500)."""
+
+    def test_imagenes_sin_cambios_con_un_hueco(self):
+        d = tmp_dir(self)
+        src, missing = with_gap(images_pdf(os.path.join(d, "in.pdf")), os.path.join(d, "hueco.pdf"))
+        out = os.path.join(d, "out.pdf")
+        lossless_clean.clean(src, out)
+        a, b = pymupdf.open(src), pymupdf.open(out)
+        self.assertNotIn(missing, pdf_check.object_numbers(a))
+        self.assertEqual(all_images(a), all_images(b))
+        self.assertEqual(renders(a), renders(b))
+        self.assertEqual(page_contents(a), page_contents(b))
+        self.assertIsNone(pdf_check.verify(src, out))
+        # La capa Flate de los JPEG (wrap_jpegs) se ha puesto igual que sin el hueco.
+        filters = {b.xref_get_key(x, "Filter")[1].replace(" ", "") for x in pdf_check.object_numbers(b)
+                   if b.xref_get_key(x, "Subtype")[1] == "/Image"}
+        self.assertIn("[/FlateDecode/DCTDecode]", filters)
+
+    def test_truetype_se_recorta_con_un_hueco(self):
+        d = tmp_dir(self)
+        plain = text_pdf(os.path.join(d, "tt.pdf"), fontbuffer=pymupdf.Font("cjk").buffer)
+        src, _ = with_gap(plain, os.path.join(d, "hueco.pdf"))
+        out = os.path.join(d, "out.pdf")
+        result = lossless_clean.clean(src, out)
+        self.assertGreater(result["fonts_subset"], 0)
+        self.assertFalse(result["subset_reverted"])
+        self.assertEqual(lossless_clean.page_texts(src), lossless_clean.page_texts(out))
+        self.assertEqual(renders(pymupdf.open(src), 150), renders(pymupdf.open(out), 150))
+
+    def test_linea_de_comandos_con_un_hueco(self):
+        d = tmp_dir(self)
+        src, _ = with_gap(images_pdf(os.path.join(d, "in.pdf")), os.path.join(d, "hueco.pdf"))
+        out = os.path.join(d, "out.pdf")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "lossless_clean.py"), src, out],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(os.path.getsize(out), os.path.getsize(src))
+
+    def test_pades_reales_de_pyhanko(self):
+        # Los PAdES de pruebas-pdf/pdf-a-word (en la imagen de la API, no en el motor publicado;
+        # sin la carpeta, se salta): todos con el hueco de pyHanko.
+        files = sorted(glob.glob(os.path.join(HERE, "..", "pruebas-pdf", "pdf-a-word", "x0*-*pades*.pdf")))
+        if not files:
+            self.skipTest("sin pruebas-pdf/pdf-a-word")
+        d = tmp_dir(self)
+        for src in files:
+            with self.subTest(pdf=os.path.basename(src)):
+                with pymupdf.open(src) as doc:
+                    self.assertLess(len(pdf_check.object_numbers(doc)), doc.xref_length() - 1, "tiene hueco")
+                out = os.path.join(d, os.path.basename(src))
+                lossless_clean.clean(src, out)
+                a, b = pymupdf.open(src), pymupdf.open(out)
+                self.assertEqual(lossless_clean.page_texts(src), lossless_clean.page_texts(out))
+                self.assertEqual(renders(a), renders(b))
+                self.assertIsNone(pdf_check.verify(src, out))
+                self.assertTrue(pdf_check.signed(b), "la estructura de la firma sigue (ya no es válida)")
+                self.assertEqual([w.field_type_string for p in a for w in p.widgets()],
+                                 [w.field_type_string for p in b for w in p.widgets()])
 
 
 class LineaDeComandos(unittest.TestCase):
